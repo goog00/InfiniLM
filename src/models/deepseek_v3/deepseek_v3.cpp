@@ -455,9 +455,9 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                 // K: [B, H, L, D] -> [B, H, D, L] (Transposed)
                 // Score: [B, H, 1, L]
                 auto scores = Tensor::buffer(dt_logits, {nreq, nh, 1, max_total_len}, rsrc.memory_pool);
-                linear(scores->reshape({nreq * nh, 1, max_total_len}), 
-                    batched_q->permute({0, 2, 1, 3})->reshape({nreq * nh, 1, d_qk}), 
-                    padded_k->permute({0, 1, 3, 2})->reshape({nreq * nh, d_qk, max_total_len}), 
+                linear(scores->view({nreq * nh, 1, max_total_len}), 
+                    batched_q->permute({0, 2, 1, 3})->view({nreq * nh, 1, d_qk}), 
+                    padded_k->permute({0, 1, 3, 2})->view({nreq * nh, d_qk, max_total_len}), 
                     1.f / float(sqrt(d_qk)), 0.f, nullptr, nullptr);
                 
                 // Add Mask
@@ -471,9 +471,9 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                 // V: [B, H, L, D]
                 // Out: [B, H, 1, D]
                 auto output = Tensor::buffer(dt_logits, {nreq, nh, 1, d_v}, rsrc.memory_pool);
-                linear(output->reshape({nreq * nh, 1, d_v}), 
-                       scores->reshape({nreq * nh, 1, max_total_len}), 
-                       padded_v->reshape({nreq * nh, max_total_len, d_v}), 
+                linear(output->view({nreq * nh, 1, d_v}), 
+                       scores->view({nreq * nh, 1, max_total_len}), 
+                       padded_v->view({nreq * nh, max_total_len, d_v}), 
                        1.f, 0.f, nullptr, nullptr);
                 
                 // Scatter Output
