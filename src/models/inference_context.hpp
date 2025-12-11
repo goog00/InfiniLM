@@ -145,6 +145,10 @@ inline void linear(std::shared_ptr<Tensor> c, std::shared_ptr<Tensor> a,
 inline void dequant_linear(std::shared_ptr<Tensor> out, std::shared_ptr<Tensor> x,
                            std::shared_ptr<Tensor> w_w, std::shared_ptr<Tensor> w_s, std::shared_ptr<Tensor> w_z,
                            float alpha, float beta, std::shared_ptr<Tensor> residual, std::shared_ptr<Tensor> bias) {
+    if (w_w->dtype() == x->dtype()) {
+        getInferenceContext().linear(out, x, w_w, alpha, beta, residual, bias);
+        return;
+    }
     auto w = Tensor::buffer(x->dtype(), {x->shape()[1], out->shape()[1]}, getInferenceContext().memory_pool);
     getInferenceContext().dequant(w, w_w, w_s, w_z);
     getInferenceContext().linear(out, x, w, alpha, beta, residual, bias);

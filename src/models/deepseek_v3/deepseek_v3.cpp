@@ -173,6 +173,22 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
         auto k_rot = kv_a_buf->slice(1, r_kv, d_rope)->view({ntok, 1, d_rope});
         rope_v2(k_rot, k_rot, pos_ids_buf, weights->sin_table, weights->cos_table);
 
+        bool is_prefill = true;
+        for (uint32_t i = 0; i < nreq; i++) {
+            if (req_pos[i] > 0) {
+                is_prefill = false;
+                break;
+            }
+        }
+
+        std::shared_ptr<Tensor> kv_b_batched;
+        if (is_prefill) {
+            kv_b_batched = Tensor::buffer(dt_logits, {ntok, nh * (d_nope + d_v)}, rsrc.memory_pool);
+            dequant_linear(kv_b_batched, kv_pass, weights->w_layers[layer].mla->kv_b_proj->w,
+                           weights->w_layers[layer].mla->kv_b_proj->s,
+                           weights->w_layers[layer].mla->kv_b_proj->z, 1.0, 0.0, nullptr, nullptr);
+        }
+
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
             auto past_len = req_pos[req];
@@ -188,19 +204,26 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
             rearrange(caches[req]->kv_pass[idev][layer]->slice(0, past_len, seq_len), kv_pass_req);
             rearrange(caches[req]->k_rot[idev][layer]->slice(0, past_len, seq_len), k_rot_req);
             // kv_b_proj
-            auto kv_b_req = kv_b_buf->slice(0, 0, total_len);
-            dequant_linear(kv_b_req, caches[req]->kv_pass[idev][layer]->slice(0, 0, total_len),
-                           weights->w_layers[layer].mla->kv_b_proj->w,
-                           weights->w_layers[layer].mla->kv_b_proj->s,
-                           weights->w_layers[layer].mla->kv_b_proj->z,
-                           1.0, 0.0, nullptr, nullptr);
+            std::shared_ptr<Tensor> kv_b_req;
+            if (is_prefill) {
+                kv_b_req = kv_b_batched->slice(0, token_offset, seq_len);
+            } else {
+                kv_b_req = kv_b_buf->slice(0, 0, total_len);
+                dequant_linear(kv_b_req, caches[req]->kv_pass[idev][layer]->slice(0, 0, total_len),
+                               weights->w_layers[layer].mla->kv_b_proj->w,
+                               weights->w_layers[layer].mla->kv_b_proj->s,
+                               weights->w_layers[layer].mla->kv_b_proj->z, 1.0, 0.0, nullptr, nullptr);
+            }
             auto full_v_req = kv_b_req->slice(1, nh * d_nope, nh * d_v);
             // concat k
             auto full_k_req = full_k_buf->slice(0, 0, total_len);
-            auto full_k_pass_req = full_k_req->slice(1, 0, nh * d_nope);
-            auto full_k_rot_req = full_k_req->slice(1, nh * d_nope, nh * d_rope);
-            rearrange(full_k_pass_req, kv_b_req->slice(1, 0, nh * d_nope));
-            rearrange(full_k_rot_req->view({total_len, nh, d_rope}), k_rot_req->view_as({total_len, nh, d_rope}, {ptrdiff_t(d_rope), 0, 1})); // expand k_rot
+            auto full_k_view = full_k_req->view({total_len, nh, d_qk});
+            auto full_k_pass_req = full_k_view->slice(2, 0, d_nope);
+            auto full_k_rot_req = full_k_view->slice(2, d_nope, d_rope);
+            
+            rearrange(full_k_pass_req, kv_b_req->slice(1, 0, nh * d_nope)->view({total_len, nh, d_nope}));
+            auto k_rot_cache = caches[req]->k_rot[idev][layer]->slice(0, 0, total_len);
+            rearrange(full_k_rot_req, k_rot_cache->view_as({total_len, nh, d_rope}, {ptrdiff_t(d_rope), 0, 1})); // expand k_rot
 
             // self attention
             auto attn_score_req = attn_score_buf->slice(1, 0, seq_len * total_len)->view({nh, seq_len, total_len});
