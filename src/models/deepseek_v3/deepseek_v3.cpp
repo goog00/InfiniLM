@@ -549,10 +549,10 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                 token_offset += seq_len;
             }
             RUN_INFINI(infinirtStreamSynchronize(stream));
-            RUN_INFINI(infinirtMemcpy(result_cpu.data(), result_buf->data(),
+            RUN_INFINI(infinirtMemcpy(ws->result_cpu.data(), result_buf->data(),
                                       sizeof(int64_t) * nreq, INFINIRT_MEMCPY_D2H));
             for (uint32_t req = 0; req < nreq; req++) {
-                output[req] = uint32_t(result_cpu[req]);
+                output[req] = uint32_t(ws->result_cpu[req]);
             }
         }
     }
