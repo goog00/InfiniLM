@@ -42,6 +42,34 @@ struct LayerWeight {
     std::vector<std::shared_ptr<MLPWeight>> experts;
 };
 
+struct DeepSeekV3Workspace {
+    // Common buffers
+    std::shared_ptr<Tensor> logits_in, logits_out;
+    std::shared_ptr<Tensor> q_a_buf, q_buf, kv_a_buf, o_buf;
+    std::shared_ptr<Tensor> prob_buf, result_buf;
+    std::vector<int64_t> result_cpu;
+    std::vector<uint32_t> batch_pos_ids;
+    std::shared_ptr<Tensor> pos_ids_buf;
+
+    // Layer buffers (max size)
+    std::shared_ptr<Tensor> full_k_buf, kv_b_buf, attn_score_buf, attn_val_buf;
+    std::shared_ptr<Tensor> kv_b_batched, kv_pass_combined;
+
+    // MoE buffers
+    std::shared_ptr<Tensor> moe_gate_buf, moe_up_buf;
+    std::shared_ptr<Tensor> shared_states, router_states_sum, router_logits;
+    std::shared_ptr<Tensor> values_gpu, indices_gpu;
+    std::vector<float> values_cpu;
+    std::vector<int> indices_cpu;
+
+    size_t current_max_tokens = 0;
+    size_t current_max_reqs = 0;
+    size_t current_max_total_len = 0;
+    size_t current_max_batch_len = 0;
+    size_t current_max_qk_size = 0;
+    size_t current_max_seq_len = 0;
+};
+
 struct DeepSeekV3DeviceWeights {
     std::shared_ptr<Tensor> w_in_embd, w_out_norm, w_out_embd, sin_table,
         cos_table;
@@ -73,6 +101,7 @@ struct DeepSeekV3DeviceResource {
     infinicclComm_t comm;
 
     std::shared_ptr<MemoryPool> memory_pool;
+    std::shared_ptr<DeepSeekV3Workspace> workspace;
 };
 
 struct InferState {

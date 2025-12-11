@@ -31,6 +31,7 @@ void createDeviceResource(DeepSeekV3DeviceResource *rsrc, const DeepSeekV3Meta *
         stream,
         comm,
         memory_pool,
+        std::make_shared<DeepSeekV3Workspace>(),
     };
     RUN_INFINI(infinirtDeviceSynchronize());
 }
@@ -85,49 +86,13 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
     auto stream = rsrc.stream;
 
     auto weights = rsrc.weights;
+    auto ws = rsrc.workspace;
 
-    // Allocate buffers
-    auto logits_in = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
-    auto logits_out = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
-
-    auto q_a_buf = Tensor::buffer(dt_logits, {ntok, r_q}, rsrc.memory_pool);
-    auto q_buf = Tensor::buffer(dt_logits, {ntok, nh * d_qk}, rsrc.memory_pool);
-    auto kv_a_buf = Tensor::buffer(dt_logits, {ntok, r_kv + d_rope}, rsrc.memory_pool);
-    auto o_buf = Tensor::buffer(dt_logits, {ntok, nh * d_v}, rsrc.memory_pool);
-
-    auto prob_buf = Tensor::buffer(dt_logits, {nreq, dvoc}, rsrc.memory_pool);
-    auto result_buf = Tensor::buffer(INFINI_DTYPE_I64, {nreq}, rsrc.memory_pool);
-    auto result_cpu = std::vector<int64_t>(nreq);
-
-    // Prepare inputs
-    auto batch_pos_ids = std::vector<uint32_t>(ntok);
-    size_t req_start = 0;
-    for (uint32_t req = 0; req < nreq; req++) {
-        for (uint32_t i = 0; i < req_lens[req]; i++) {
-            batch_pos_ids[req_start + i] = req_pos[req] + i;
-        }
-        req_start += req_lens[req];
-    }
-
-    std::shared_ptr<Tensor> pos_ids_buf;
-    if (rsrc.device == INFINI_DEVICE_CPU) {
-        pos_ids_buf = Tensor::weight(batch_pos_ids.data(), INFINI_DTYPE_U32, {ntok});
-    } else {
-        pos_ids_buf = Tensor::buffer(INFINI_DTYPE_U32, {ntok}, rsrc.memory_pool);
-        RUN_INFINI(infinirtMemcpyAsync(pos_ids_buf->data(), batch_pos_ids.data(), sizeof(uint32_t) * ntok,
-                                       INFINIRT_MEMCPY_H2D, stream));
-    }
-    for (uint32_t i = 0; i < ntok; i++) {
-        RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
-                                       weights->w_in_embd->data(tokens[i] * d),
-                                       dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
-    }
-
-    // Attention
-    // attention inner
+    // Calculate max dimensions
     size_t max_qk_size = 0;
     size_t max_seq_len = 0;
     size_t max_total_len = 0;
+    size_t total_batch_len = 0;
 
     for (uint32_t req = 0; req < nreq; req++) {
         auto past_len = req_pos[req];
@@ -137,11 +102,111 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
         max_qk_size = std::max(max_qk_size, size_t(seq_len * total_len));
         max_seq_len = std::max(max_seq_len, size_t(seq_len));
         max_total_len = std::max(max_total_len, size_t(total_len));
+        total_batch_len += total_len;
     }
-    auto full_k_buf = Tensor::buffer(dt_logits, {max_total_len, nh * d_qk}, rsrc.memory_pool);
-    auto kv_b_buf = Tensor::buffer(dt_logits, {max_total_len, nh * (d_nope + d_v)}, rsrc.memory_pool);
-    auto attn_score_buf = Tensor::buffer(dt_logits, {nh, max_qk_size}, rsrc.memory_pool);
-    auto attn_val_buf = Tensor::buffer(dt_logits, {nh, max_seq_len, d_v}, rsrc.memory_pool);
+
+    // Resize Workspace if needed
+    if (ntok > ws->current_max_tokens) {
+        size_t new_size = std::max(size_t(ntok * 1.5), size_t(4096));
+        ws->logits_in = Tensor::buffer(dt_logits, {new_size, d}, rsrc.memory_pool);
+        ws->logits_out = Tensor::buffer(dt_logits, {new_size, d}, rsrc.memory_pool);
+        ws->q_a_buf = Tensor::buffer(dt_logits, {new_size, r_q}, rsrc.memory_pool);
+        ws->q_buf = Tensor::buffer(dt_logits, {new_size, nh * d_qk}, rsrc.memory_pool);
+        ws->kv_a_buf = Tensor::buffer(dt_logits, {new_size, r_kv + d_rope}, rsrc.memory_pool);
+        ws->o_buf = Tensor::buffer(dt_logits, {new_size, nh * d_v}, rsrc.memory_pool);
+        
+        ws->moe_gate_buf = Tensor::buffer(dt_logits, {new_size, meta.di_moe}, rsrc.memory_pool);
+        ws->moe_up_buf = Tensor::buffer(dt_logits, {new_size, meta.di_moe}, rsrc.memory_pool);
+        ws->shared_states = Tensor::buffer(dt_logits, {new_size, d}, rsrc.memory_pool);
+        ws->router_states_sum = Tensor::buffer(dt_logits, {new_size, d}, rsrc.memory_pool);
+        ws->router_logits = Tensor::buffer(dt_logits, {new_size, meta.nexperts}, rsrc.memory_pool);
+        ws->values_gpu = Tensor::buffer(INFINI_DTYPE_F32, {new_size * 8}, rsrc.memory_pool);
+        ws->indices_gpu = Tensor::buffer(INFINI_DTYPE_I32, {new_size * 8}, rsrc.memory_pool);
+        
+        if (rsrc.device != INFINI_DEVICE_CPU) {
+            ws->pos_ids_buf = Tensor::buffer(INFINI_DTYPE_U32, {new_size}, rsrc.memory_pool);
+        }
+        
+        ws->batch_pos_ids.resize(new_size);
+        ws->values_cpu.resize(new_size * 8);
+        ws->indices_cpu.resize(new_size * 8);
+        
+        ws->current_max_tokens = new_size;
+    }
+
+    if (nreq > ws->current_max_reqs) {
+        size_t new_size = std::max(size_t(nreq * 1.5), size_t(128));
+        ws->prob_buf = Tensor::buffer(dt_logits, {new_size, dvoc}, rsrc.memory_pool);
+        ws->result_buf = Tensor::buffer(INFINI_DTYPE_I64, {new_size}, rsrc.memory_pool);
+        ws->result_cpu.resize(new_size);
+        ws->current_max_reqs = new_size;
+    }
+
+    if (max_total_len > ws->current_max_total_len) {
+        size_t new_size = std::max(size_t(max_total_len * 1.5), size_t(4096));
+        ws->full_k_buf = Tensor::buffer(dt_logits, {new_size, nh * d_qk}, rsrc.memory_pool);
+        ws->kv_b_buf = Tensor::buffer(dt_logits, {new_size, nh * (d_nope + d_v)}, rsrc.memory_pool);
+        ws->current_max_total_len = new_size;
+    }
+
+    if (total_batch_len > ws->current_max_batch_len) {
+        size_t new_size = std::max(size_t(total_batch_len * 1.5), size_t(4096));
+        ws->kv_b_batched = Tensor::buffer(dt_logits, {new_size, nh * (d_nope + d_v)}, rsrc.memory_pool);
+        ws->kv_pass_combined = Tensor::buffer(dt_logits, {new_size, r_kv}, rsrc.memory_pool);
+        ws->current_max_batch_len = new_size;
+    }
+
+    // Views
+    auto logits_in = ws->logits_in->slice(0, 0, ntok);
+    auto logits_out = ws->logits_out->slice(0, 0, ntok);
+    auto q_a_buf = ws->q_a_buf->slice(0, 0, ntok);
+    auto q_buf = ws->q_buf->slice(0, 0, ntok);
+    auto kv_a_buf = ws->kv_a_buf->slice(0, 0, ntok);
+    auto o_buf = ws->o_buf->slice(0, 0, ntok);
+    auto prob_buf = ws->prob_buf->slice(0, 0, nreq);
+    auto result_buf = ws->result_buf->slice(0, 0, nreq);
+    // auto result_cpu = ws->result_cpu; // Use directly
+    
+    // Prepare inputs
+    size_t req_start = 0;
+    for (uint32_t req = 0; req < nreq; req++) {
+        for (uint32_t i = 0; i < req_lens[req]; i++) {
+            ws->batch_pos_ids[req_start + i] = req_pos[req] + i;
+        }
+        req_start += req_lens[req];
+    }
+
+    std::shared_ptr<Tensor> pos_ids_buf;
+    if (rsrc.device == INFINI_DEVICE_CPU) {
+        pos_ids_buf = Tensor::weight(ws->batch_pos_ids.data(), INFINI_DTYPE_U32, {ntok});
+    } else {
+        pos_ids_buf = ws->pos_ids_buf->slice(0, 0, ntok);
+        RUN_INFINI(infinirtMemcpyAsync(pos_ids_buf->data(), ws->batch_pos_ids.data(), sizeof(uint32_t) * ntok,
+                                       INFINIRT_MEMCPY_H2D, stream));
+    }
+    for (uint32_t i = 0; i < ntok; i++) {
+        RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
+                                       weights->w_in_embd->data(tokens[i] * d),
+                                       dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+    }
+
+    // Attention buffers
+    auto full_k_buf = ws->full_k_buf->slice(0, 0, max_total_len);
+    auto kv_b_buf = ws->kv_b_buf->slice(0, 0, max_total_len);
+    
+    if (max_qk_size > ws->current_max_qk_size) {
+        size_t new_size = std::max(size_t(max_qk_size * 1.5), size_t(4096));
+        ws->attn_score_buf = Tensor::buffer(dt_logits, {nh, new_size}, rsrc.memory_pool);
+        ws->current_max_qk_size = new_size;
+    }
+    if (max_seq_len > ws->current_max_seq_len) {
+        size_t new_size = std::max(size_t(max_seq_len * 1.5), size_t(128));
+        ws->attn_val_buf = Tensor::buffer(dt_logits, {nh, new_size, d_v}, rsrc.memory_pool);
+        ws->current_max_seq_len = new_size;
+    }
+    
+    auto attn_score_buf = ws->attn_score_buf->slice(1, 0, max_qk_size);
+    auto attn_val_buf = ws->attn_val_buf->slice(1, 0, max_seq_len);
 
     // Compute
     for (uint32_t layer = 0; layer < nlayer; layer++) {
@@ -187,14 +252,14 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
 
         if (is_prefill) {
             // Prefill: Input is contiguous in kv_pass
-            kv_b_batched = Tensor::buffer(dt_logits, {ntok, nh * (d_nope + d_v)}, rsrc.memory_pool);
+            kv_b_batched = ws->kv_b_batched->slice(0, 0, ntok);
             dequant_linear(kv_b_batched, kv_pass, weights->w_layers[layer].mla->kv_b_proj->w,
                            weights->w_layers[layer].mla->kv_b_proj->s,
                            weights->w_layers[layer].mla->kv_b_proj->z, 1.0, 0.0, nullptr, nullptr);
         } else {
             // Decode/Mixed: Gather inputs from caches
-            kv_pass_combined = Tensor::buffer(dt_logits, {total_batch_len, r_kv}, rsrc.memory_pool);
-            kv_b_batched = Tensor::buffer(dt_logits, {total_batch_len, nh * (d_nope + d_v)}, rsrc.memory_pool);
+            kv_pass_combined = ws->kv_pass_combined->slice(0, 0, total_batch_len);
+            kv_b_batched = ws->kv_b_batched->slice(0, 0, total_batch_len);
             
             size_t current_offset = 0;
             size_t token_offset = 0;
@@ -321,21 +386,21 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
             //                     后面几层，用的 稀疏MLP                                  //
             // ------------------------------------------------------------------------ //
             // 需要提前申请的缓存，给每个MLP使用
-            auto moe_gate_buf = Tensor::buffer(dt_logits, {ntok, meta.di_moe}, rsrc.memory_pool);
-            auto moe_up_buf = Tensor::buffer(dt_logits, {ntok, meta.di_moe}, rsrc.memory_pool);
+            auto moe_gate_buf = ws->moe_gate_buf->slice(0, 0, ntok);
+            auto moe_up_buf = ws->moe_up_buf->slice(0, 0, ntok);
 
             // 需要提前申请的缓存
-            std::shared_ptr<Tensor> shared_states = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);     // 用于存储共享专家的输出
-            std::shared_ptr<Tensor> router_states_sum = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool); // 用于存储路由专家的加权输出
+            std::shared_ptr<Tensor> shared_states = ws->shared_states->slice(0, 0, ntok);     // 用于存储共享专家的输出
+            std::shared_ptr<Tensor> router_states_sum = ws->router_states_sum->slice(0, 0, ntok); // 用于存储路由专家的加权输出
 
             // 需要提前申请的缓存
-            std::shared_ptr<Tensor> router_logits = Tensor::buffer(dt_logits, {ntok, meta.nexperts}, rsrc.memory_pool); // nx256，路由专家的权重
+            std::shared_ptr<Tensor> router_logits = ws->router_logits->slice(0, 0, ntok); // nx256，路由专家的权重
 
-            std::shared_ptr<Tensor> values_gpu = Tensor::buffer(infiniDtype_t::INFINI_DTYPE_F32, {ntok * 8}, rsrc.memory_pool);  // 用于存储topkrouter的输出，每个expert对应的加权权重。
-            std::shared_ptr<Tensor> indices_gpu = Tensor::buffer(infiniDtype_t::INFINI_DTYPE_I32, {ntok * 8}, rsrc.memory_pool); // 用于存储topkrouter的输出，要经过哪些专家id（从256个中选8个）
-            std::vector<float> values_cpu(ntok * 8, 0.f);                                                                        // 用于存储topkrouter的输出，每个expert对应的加权权重。（从256个中选8个）
-            std::vector<int> indices_cpu(ntok * 8, 0);                                                                           // 用于存储topkrouter的输出，要经过哪些专家的索引。
-
+            std::shared_ptr<Tensor> values_gpu = ws->values_gpu->slice(0, 0, ntok * 8);  // 用于存储topkrouter的输出，每个expert对应的加权权重。
+            std::shared_ptr<Tensor> indices_gpu = ws->indices_gpu->slice(0, 0, ntok * 8); // 用于存储topkrouter的输出，要经过哪些专家id（从256个中选8个）
+            // Use workspace vectors directly (no need to slice std::vector, just use data ptr or resize if needed, but we resized already)
+            // We can just use ws->values_cpu.data()
+            
             // config 参数
             float routed_scaling_factor = meta.routed_scale; // config.json的超参"routed_scaling_factor"，是固定值 2.5
             size_t topk = 8;                                 // config.json的超参"num_experts_per_tok",  是固定值 8
@@ -374,8 +439,8 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
 
                 auto gate_correction_bias = weights->w_layers[layer].route->b;
                 topkrouter(values_gpu, indices_gpu, router_logits, gate_correction_bias, routed_scaling_factor, topk);
-                RUN_INFINI(infinirtMemcpy((void *)values_cpu.data(), values_gpu->data(), values_cpu.size() * sizeof(float), INFINIRT_MEMCPY_D2H));
-                RUN_INFINI(infinirtMemcpy((void *)indices_cpu.data(), indices_gpu->data(), indices_cpu.size() * sizeof(int), INFINIRT_MEMCPY_D2H));
+                RUN_INFINI(infinirtMemcpy((void *)ws->values_cpu.data(), values_gpu->data(), ntok * 8 * sizeof(float), INFINIRT_MEMCPY_D2H));
+                RUN_INFINI(infinirtMemcpy((void *)ws->indices_cpu.data(), indices_gpu->data(), ntok * 8 * sizeof(int), INFINIRT_MEMCPY_D2H));
             }
 
             // (3) MoE操作：  hidden_states经过一个8个路由专家
@@ -392,8 +457,8 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                 {
                     // 输入: hidden_states
                     // 输出: router_states_sum_i
-                    int index = indices_cpu[itok * topk];
-                    float alpha = values_cpu[itok * topk];
+                    int index = ws->indices_cpu[itok * topk];
+                    float alpha = ws->values_cpu[itok * topk];
 
                     dequant_linear(moe_gate_buf_i, hidden_states_i,
                                    weights->w_layers[layer].experts[index]->gate->w,
@@ -414,8 +479,8 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
 
                 // 经过后续的专家 : C  = alpha * AB + C_last
                 for (size_t k = 1; k < topk; ++k) {
-                    int index = indices_cpu[itok * topk + k];
-                    float alpha = values_cpu[itok * topk + k];
+                    int index = ws->indices_cpu[itok * topk + k];
+                    float alpha = ws->values_cpu[itok * topk + k];
 
                     dequant_linear(moe_gate_buf_i, hidden_states_i,
                                    weights->w_layers[layer].experts[index]->gate->w,
