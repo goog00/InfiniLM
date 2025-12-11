@@ -174,46 +174,84 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
         rope_v2(k_rot, k_rot, pos_ids_buf, weights->sin_table, weights->cos_table);
 
         bool is_prefill = true;
+        size_t total_batch_len = 0;
         for (uint32_t i = 0; i < nreq; i++) {
             if (req_pos[i] > 0) {
                 is_prefill = false;
-                break;
             }
+            total_batch_len += req_pos[i] + req_lens[i];
         }
 
         std::shared_ptr<Tensor> kv_b_batched;
+        std::shared_ptr<Tensor> kv_pass_combined;
+
         if (is_prefill) {
+            // Prefill: Input is contiguous in kv_pass
             kv_b_batched = Tensor::buffer(dt_logits, {ntok, nh * (d_nope + d_v)}, rsrc.memory_pool);
             dequant_linear(kv_b_batched, kv_pass, weights->w_layers[layer].mla->kv_b_proj->w,
+                           weights->w_layers[layer].mla->kv_b_proj->s,
+                           weights->w_layers[layer].mla->kv_b_proj->z, 1.0, 0.0, nullptr, nullptr);
+        } else {
+            // Decode/Mixed: Gather inputs from caches
+            kv_pass_combined = Tensor::buffer(dt_logits, {total_batch_len, r_kv}, rsrc.memory_pool);
+            kv_b_batched = Tensor::buffer(dt_logits, {total_batch_len, nh * (d_nope + d_v)}, rsrc.memory_pool);
+            
+            size_t current_offset = 0;
+            size_t token_offset = 0;
+            for (uint32_t req = 0; req < nreq; req++) {
+                auto past_len = req_pos[req];
+                auto seq_len = req_lens[req];
+                auto total_len = past_len + seq_len;
+
+                auto kv_a_req = kv_a_buf->slice({{0, token_offset, seq_len}});
+                auto kv_pass_req = kv_a_req->slice(1, 0, r_kv);
+                auto k_rot_req = kv_a_req->slice(1, r_kv, d_rope);
+
+                // Update Cache
+                rearrange(caches[req]->kv_pass[idev][layer]->slice(0, past_len, seq_len), kv_pass_req);
+                rearrange(caches[req]->k_rot[idev][layer]->slice(0, past_len, seq_len), k_rot_req);
+
+                // Copy to combined buffer
+                rearrange(kv_pass_combined->slice(0, current_offset, total_len), 
+                          caches[req]->kv_pass[idev][layer]->slice(0, 0, total_len));
+
+                current_offset += total_len;
+                token_offset += seq_len;
+            }
+
+            // Batched Projection
+            dequant_linear(kv_b_batched, kv_pass_combined, 
+                           weights->w_layers[layer].mla->kv_b_proj->w,
                            weights->w_layers[layer].mla->kv_b_proj->s,
                            weights->w_layers[layer].mla->kv_b_proj->z, 1.0, 0.0, nullptr, nullptr);
         }
 
         size_t token_offset = 0;
+        size_t current_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
             auto past_len = req_pos[req];
             auto seq_len = req_lens[req];
             auto total_len = past_len + seq_len;
             auto o_req = o_buf->slice({{0, token_offset, seq_len}})->view({seq_len, nh, d_v});
             auto q_req = q_buf->slice({{0, token_offset, seq_len}});
-            auto kv_a_req = kv_a_buf->slice({{0, token_offset, seq_len}});
-            auto kv_pass_req = kv_a_req->slice(1, 0, r_kv);
-            auto k_rot_req = kv_a_req->slice(1, r_kv, d_rope);
+            
+            // If prefill, cache update was not done in the gather loop
+            if (is_prefill) {
+                auto kv_a_req = kv_a_buf->slice({{0, token_offset, seq_len}});
+                auto kv_pass_req = kv_a_req->slice(1, 0, r_kv);
+                auto k_rot_req = kv_a_req->slice(1, r_kv, d_rope);
+                rearrange(caches[req]->kv_pass[idev][layer]->slice(0, past_len, seq_len), kv_pass_req);
+                rearrange(caches[req]->k_rot[idev][layer]->slice(0, past_len, seq_len), k_rot_req);
+            }
 
-            // concat cache
-            rearrange(caches[req]->kv_pass[idev][layer]->slice(0, past_len, seq_len), kv_pass_req);
-            rearrange(caches[req]->k_rot[idev][layer]->slice(0, past_len, seq_len), k_rot_req);
-            // kv_b_proj
+            // kv_b_proj result
             std::shared_ptr<Tensor> kv_b_req;
             if (is_prefill) {
                 kv_b_req = kv_b_batched->slice(0, token_offset, seq_len);
             } else {
-                kv_b_req = kv_b_buf->slice(0, 0, total_len);
-                dequant_linear(kv_b_req, caches[req]->kv_pass[idev][layer]->slice(0, 0, total_len),
-                               weights->w_layers[layer].mla->kv_b_proj->w,
-                               weights->w_layers[layer].mla->kv_b_proj->s,
-                               weights->w_layers[layer].mla->kv_b_proj->z, 1.0, 0.0, nullptr, nullptr);
+                kv_b_req = kv_b_batched->slice(0, current_offset, total_len);
             }
+            
             auto full_v_req = kv_b_req->slice(1, nh * d_nope, nh * d_v);
             // concat k
             auto full_k_req = full_k_buf->slice(0, 0, total_len);
@@ -240,6 +278,7 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
             rearrange(o_req, attn_val_req->permute({1, 0, 2}));
 
             token_offset += seq_len;
+            current_offset += total_len;
         }
 
         // o_proj
