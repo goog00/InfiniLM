@@ -461,9 +461,16 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                     1.f / float(sqrt(d_qk)), 0.f, nullptr, nullptr);
                 
                 // Add Mask
-                add(scores->view({nreq, nh, max_total_len}), 
-                    scores->view({nreq, nh, max_total_len}), 
-                    attn_mask->view({nreq, 1, max_total_len}));
+                // Explicitly broadcast mask to avoid backend descriptor errors
+                auto expanded_mask = Tensor::buffer(dt_logits, {nreq, nh, 1, max_total_len}, rsrc.memory_pool);
+                for (size_t h = 0; h < nh; ++h) {
+                    rearrange(expanded_mask->slice(1, h, 1), attn_mask);
+                }
+                
+                // Perform add on flattened tensors to ensure compatibility
+                add(scores->view({scores->numel()}), 
+                    scores->view({scores->numel()}), 
+                    expanded_mask->view({expanded_mask->numel()}));
                 
                 // Softmax
                 causalSoftmax(scores->view({nreq * nh, max_total_len}), 
