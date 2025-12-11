@@ -157,17 +157,25 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
     }
 
     // Resize Padded Attention Buffers
-    size_t needed_padded_size = ws->current_max_reqs * ws->current_max_total_len;
-    if (needed_padded_size > 0 && (ws->padded_k_buf == nullptr || needed_padded_size > ws->padded_k_buf->shape()[0] * ws->padded_k_buf->shape()[1])) {
-        size_t new_reqs = ws->current_max_reqs;
-        size_t new_len = ws->current_max_total_len;
-        ws->padded_k_buf = Tensor::buffer(dt_logits, {new_reqs, new_len, nh, d_qk}, rsrc.memory_pool);
-        ws->padded_v_buf = Tensor::buffer(dt_logits, {new_reqs, new_len, nh, d_v}, rsrc.memory_pool);
-        ws->attn_mask_buf = Tensor::buffer(dt_logits, {new_reqs, 1, 1, new_len}, rsrc.memory_pool);
-        ws->attn_mask_cpu.resize(new_reqs * new_len);
-    }
-    if (ws->current_max_reqs > 0 && (ws->batched_q_buf == nullptr || ws->current_max_reqs > ws->batched_q_buf->shape()[0])) {
-        ws->batched_q_buf = Tensor::buffer(dt_logits, {ws->current_max_reqs, 1, nh, d_qk}, rsrc.memory_pool);
+    // Use separate tracking to avoid allocating [MaxReqs * 4096] when not needed
+    if (nreq > ws->current_padded_reqs || max_total_len > ws->current_padded_len) {
+        size_t new_reqs = std::max(size_t(nreq * 1.2), ws->current_padded_reqs);
+        new_reqs = std::max(new_reqs, size_t(16)); // Min 16 reqs
+        
+        size_t new_len = std::max(size_t(max_total_len * 1.2), ws->current_padded_len);
+        new_len = std::max(new_len, size_t(256)); // Min 256 len, not 4096
+        
+        // Only reallocate if actually larger
+        if (new_reqs > ws->current_padded_reqs || new_len > ws->current_padded_len) {
+             ws->padded_k_buf = Tensor::buffer(dt_logits, {new_reqs, new_len, nh, d_qk}, rsrc.memory_pool);
+             ws->padded_v_buf = Tensor::buffer(dt_logits, {new_reqs, new_len, nh, d_v}, rsrc.memory_pool);
+             ws->attn_mask_buf = Tensor::buffer(dt_logits, {new_reqs, 1, 1, new_len}, rsrc.memory_pool);
+             ws->attn_mask_cpu.resize(new_reqs * new_len);
+             ws->batched_q_buf = Tensor::buffer(dt_logits, {new_reqs, 1, nh, d_qk}, rsrc.memory_pool);
+             
+             ws->current_padded_reqs = new_reqs;
+             ws->current_padded_len = new_len;
+        }
     }
 
     // Views

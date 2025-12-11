@@ -72,6 +72,10 @@ struct DeepSeekV3Workspace {
     size_t current_max_batch_len = 0;
     size_t current_max_qk_size = 0;
     size_t current_max_seq_len = 0;
+    
+    // Separate tracking for padded buffers to avoid OOM
+    size_t current_padded_reqs = 0;
+    size_t current_padded_len = 0;
 };
 
 struct DeepSeekV3DeviceWeights {
