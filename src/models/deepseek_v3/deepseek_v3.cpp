@@ -411,10 +411,24 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                 }
                 
                 // Upload Mask
-                RUN_INFINI(infinirtMemcpyAsync(attn_mask->data(), ws->attn_mask_cpu.data(), 
+                if (dt_logits == INFINI_DTYPE_BF16) {
+                    std::vector<uint16_t> mask_bf16(nreq * max_total_len);
+                    for(size_t i=0; i<mask_bf16.size(); ++i) {
+                        mask_bf16[i] = f32_to_bf16(ws->attn_mask_cpu[i]);
+                    }
+                    RUN_INFINI(infinirtMemcpyAsync(attn_mask->data(), mask_bf16.data(), 
+                                            nreq * max_total_len * sizeof(uint16_t), INFINIRT_MEMCPY_H2D, stream));
+                } else if (dt_logits == INFINI_DTYPE_F16) {
+                    std::vector<uint16_t> mask_f16(nreq * max_total_len);
+                    for(size_t i=0; i<mask_f16.size(); ++i) {
+                        mask_f16[i] = f32_to_f16(ws->attn_mask_cpu[i]);
+                    }
+                    RUN_INFINI(infinirtMemcpyAsync(attn_mask->data(), mask_f16.data(), 
+                                            nreq * max_total_len * sizeof(uint16_t), INFINIRT_MEMCPY_H2D, stream));
+                } else {
+                    RUN_INFINI(infinirtMemcpyAsync(attn_mask->data(), ws->attn_mask_cpu.data(), 
                                             nreq * max_total_len * sizeof(float), INFINIRT_MEMCPY_H2D, stream));
-
-                // Batched Attention Compute
+                }                // Batched Attention Compute
                 // Q: [B, 1, H, D] -> [B, H, 1, D]
                 // K: [B, L, H, D] -> [B, H, D, L] (Transposed)
                 // Score: [B, H, 1, L]
