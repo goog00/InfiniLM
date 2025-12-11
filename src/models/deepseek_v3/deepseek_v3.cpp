@@ -350,83 +350,137 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                            weights->w_layers[layer].mla->kv_b_proj->s,
                            weights->w_layers[layer].mla->kv_b_proj->z, 1.0, 0.0, nullptr, nullptr);
 
-            // Batched Attention Preparation
-            // Slice to current max_total_len to ensure view() works correctly
-            auto padded_k = ws->padded_k_buf->slice(0, 0, nreq)->slice(1, 0, max_total_len);
-            auto padded_v = ws->padded_v_buf->slice(0, 0, nreq)->slice(1, 0, max_total_len);
-            auto batched_q = ws->batched_q_buf->slice(0, 0, nreq);
-            // Use a fresh contiguous buffer for mask to simplify CPU->GPU copy
-            auto attn_mask = Tensor::buffer(dt_logits, {nreq, 1, 1, max_total_len}, rsrc.memory_pool);
-
-            current_offset = 0;
-            token_offset = 0;
-            for (uint32_t req = 0; req < nreq; req++) {
-                auto seq_len = req_lens[req];
-                auto total_len = req_pos[req] + seq_len;
-                
-                auto kv_b_req = kv_b_batched->slice(0, current_offset, total_len);
-                auto k_rot_cache = caches[req]->k_rot[idev][layer]->slice(0, 0, total_len);
-                
-                // Assemble Padded K
-                auto padded_k_req = padded_k->slice(0, req, 1)->view({max_total_len, nh, d_qk})->slice(0, 0, total_len);
-                auto padded_k_pass = padded_k_req->slice(2, 0, d_nope);
-                auto padded_k_rot = padded_k_req->slice(2, d_nope, d_rope);
-                rearrange(padded_k_pass, kv_b_req->slice(1, 0, nh * d_nope)->view({total_len, nh, d_nope}));
-                rearrange(padded_k_rot, k_rot_cache->view_as({total_len, nh, d_rope}, {ptrdiff_t(d_rope), 0, 1}));
-                
-                // Assemble Padded V
-                auto padded_v_req = padded_v->slice(0, req, 1)->view({max_total_len, nh, d_v})->slice(0, 0, total_len);
-                auto full_v_req = kv_b_req->slice(1, nh * d_nope, nh * d_v);
-                rearrange(padded_v_req, full_v_req->view({total_len, nh, d_v}));
-                
-                // Assemble Batched Q
-                auto q_req = q_buf->slice({{0, token_offset, seq_len}});
-                rearrange(batched_q->slice(0, req, 1), q_req->view({1, 1, nh, d_qk}));
-                
-                // Mask
-                std::fill(ws->attn_mask_cpu.begin() + req * max_total_len, 
-                          ws->attn_mask_cpu.begin() + req * max_total_len + total_len, 0.0f);
-                std::fill(ws->attn_mask_cpu.begin() + req * max_total_len + total_len, 
-                          ws->attn_mask_cpu.begin() + (req + 1) * max_total_len, -1e9f);
-
-                current_offset += total_len;
-                token_offset += seq_len;
+            bool is_pure_decode = true;
+            for (uint32_t i = 0; i < nreq; i++) {
+                if (req_lens[i] != 1) {
+                    is_pure_decode = false;
+                    break;
+                }
             }
-            
-            // Upload Mask
-            RUN_INFINI(infinirtMemcpyAsync(attn_mask->data(), ws->attn_mask_cpu.data(), 
-                                           nreq * max_total_len * sizeof(float), INFINIRT_MEMCPY_H2D, stream));
 
-            // Batched Attention Compute
-            // Q: [B, 1, H, D] -> [B, H, 1, D]
-            // K: [B, L, H, D] -> [B, H, D, L] (Transposed)
-            // Score: [B, H, 1, L]
-            auto scores = Tensor::buffer(dt_logits, {nreq, nh, 1, max_total_len}, rsrc.memory_pool);
-            linear(scores, 
-                   batched_q->permute({0, 2, 1, 3}), 
-                   padded_k->permute({0, 2, 3, 1}), 
-                   1.f / float(sqrt(d_qk)), 0.f, nullptr, nullptr);
-            
-            // Add Mask
-            add(scores, scores, attn_mask);
-            
-            // Softmax
-            causalSoftmax(scores, scores);
-            
-            // Output: Score * V
-            // Score: [B, H, 1, L]
-            // V: [B, L, H, D] -> [B, H, L, D]
-            // Out: [B, H, 1, D]
-            auto output = Tensor::buffer(dt_logits, {nreq, nh, 1, d_v}, rsrc.memory_pool);
-            linear(output, scores, padded_v->permute({0, 2, 1, 3}), 1.f, 0.f, nullptr, nullptr);
-            
-            // Scatter Output
-            token_offset = 0;
-            for (uint32_t req = 0; req < nreq; req++) {
-                auto seq_len = req_lens[req];
-                auto o_req = o_buf->slice({{0, token_offset, seq_len}})->view({seq_len, nh, d_v});
-                rearrange(o_req, output->slice(0, req, 1)->view({nh, 1, d_v})->permute({1, 0, 2}));
-                token_offset += seq_len;
+            if (is_pure_decode) {
+                // Batched Attention Preparation (Optimized for Decode)
+                // Slice to current max_total_len to ensure view() works correctly
+                auto padded_k = ws->padded_k_buf->slice(0, 0, nreq)->slice(1, 0, max_total_len);
+                auto padded_v = ws->padded_v_buf->slice(0, 0, nreq)->slice(1, 0, max_total_len);
+                auto batched_q = ws->batched_q_buf->slice(0, 0, nreq);
+                // Use a fresh contiguous buffer for mask to simplify CPU->GPU copy
+                auto attn_mask = Tensor::buffer(dt_logits, {nreq, 1, 1, max_total_len}, rsrc.memory_pool);
+
+                current_offset = 0;
+                token_offset = 0;
+                for (uint32_t req = 0; req < nreq; req++) {
+                    auto seq_len = req_lens[req];
+                    auto total_len = req_pos[req] + seq_len;
+                    
+                    auto kv_b_req = kv_b_batched->slice(0, current_offset, total_len);
+                    auto k_rot_cache = caches[req]->k_rot[idev][layer]->slice(0, 0, total_len);
+                    
+                    // Assemble Padded K
+                    auto padded_k_req = padded_k->slice(0, req, 1)->view({max_total_len, nh, d_qk})->slice(0, 0, total_len);
+                    auto padded_k_pass = padded_k_req->slice(2, 0, d_nope);
+                    auto padded_k_rot = padded_k_req->slice(2, d_nope, d_rope);
+                    rearrange(padded_k_pass, kv_b_req->slice(1, 0, nh * d_nope)->view({total_len, nh, d_nope}));
+                    rearrange(padded_k_rot, k_rot_cache->view_as({total_len, nh, d_rope}, {ptrdiff_t(d_rope), 0, 1}));
+                    
+                    // Assemble Padded V
+                    auto padded_v_req = padded_v->slice(0, req, 1)->view({max_total_len, nh, d_v})->slice(0, 0, total_len);
+                    auto full_v_req = kv_b_req->slice(1, nh * d_nope, nh * d_v);
+                    rearrange(padded_v_req, full_v_req->view({total_len, nh, d_v}));
+                    
+                    // Assemble Batched Q
+                    auto q_req = q_buf->slice({{0, token_offset, seq_len}});
+                    rearrange(batched_q->slice(0, req, 1), q_req->view({1, 1, nh, d_qk}));
+                    
+                    // Mask
+                    std::fill(ws->attn_mask_cpu.begin() + req * max_total_len, 
+                            ws->attn_mask_cpu.begin() + req * max_total_len + total_len, 0.0f);
+                    std::fill(ws->attn_mask_cpu.begin() + req * max_total_len + total_len, 
+                            ws->attn_mask_cpu.begin() + (req + 1) * max_total_len, -1e9f);
+
+                    current_offset += total_len;
+                    token_offset += seq_len;
+                }
+                
+                // Upload Mask
+                RUN_INFINI(infinirtMemcpyAsync(attn_mask->data(), ws->attn_mask_cpu.data(), 
+                                            nreq * max_total_len * sizeof(float), INFINIRT_MEMCPY_H2D, stream));
+
+                // Batched Attention Compute
+                // Q: [B, 1, H, D] -> [B, H, 1, D]
+                // K: [B, L, H, D] -> [B, H, D, L] (Transposed)
+                // Score: [B, H, 1, L]
+                auto scores = Tensor::buffer(dt_logits, {nreq, nh, 1, max_total_len}, rsrc.memory_pool);
+                linear(scores, 
+                    batched_q->permute({0, 2, 1, 3}), 
+                    padded_k->permute({0, 2, 3, 1}), 
+                    1.f / float(sqrt(d_qk)), 0.f, nullptr, nullptr);
+                
+                // Add Mask
+                add(scores, scores, attn_mask);
+                
+                // Softmax
+                causalSoftmax(scores, scores);
+                
+                // Output: Score * V
+                // Score: [B, H, 1, L]
+                // V: [B, L, H, D] -> [B, H, L, D]
+                // Out: [B, H, 1, D]
+                auto output = Tensor::buffer(dt_logits, {nreq, nh, 1, d_v}, rsrc.memory_pool);
+                linear(output, scores, padded_v->permute({0, 2, 1, 3}), 1.f, 0.f, nullptr, nullptr);
+                
+                // Scatter Output
+                token_offset = 0;
+                for (uint32_t req = 0; req < nreq; req++) {
+                    auto seq_len = req_lens[req];
+                    auto o_req = o_buf->slice({{0, token_offset, seq_len}})->view({seq_len, nh, d_v});
+                    rearrange(o_req, output->slice(0, req, 1)->view({nh, 1, d_v})->permute({1, 0, 2}));
+                    token_offset += seq_len;
+                }
+            } else {
+                // Fallback: Serial Attention (for Mixed/Prefill-with-history)
+                current_offset = 0;
+                token_offset = 0;
+                for (uint32_t req = 0; req < nreq; req++) {
+                    auto seq_len = req_lens[req];
+                    auto total_len = req_pos[req] + seq_len;
+                    
+                    auto kv_b_req = kv_b_batched->slice(0, current_offset, total_len);
+                    auto k_rot_cache = caches[req]->k_rot[idev][layer]->slice(0, 0, total_len);
+                    
+                    // Reconstruct Full K
+                    auto full_k_req = full_k_buf->slice(0, 0, total_len);
+                    auto full_k_view = full_k_req->view({total_len, nh, d_qk});
+                    
+                    rearrange(full_k_view->slice(2, 0, d_nope), 
+                              kv_b_req->slice(1, 0, nh * d_nope)->view({total_len, nh, d_nope}));
+                    rearrange(full_k_view->slice(2, d_nope, d_rope), 
+                              k_rot_cache->view_as({total_len, nh, d_rope}, {ptrdiff_t(d_rope), 0, 1}));
+                    
+                    // Full V
+                    auto full_v_req = kv_b_req->slice(1, nh * d_nope, nh * d_v)->view({total_len, nh, d_v});
+                    
+                    // Q
+                    auto q_req = q_buf->slice({{0, token_offset, seq_len}});
+
+                    // Attention
+                    auto attn_score_req = attn_score_buf->slice(1, 0, seq_len * total_len)->view({nh, seq_len, total_len});
+                    linear(attn_score_req,
+                           q_req->view({seq_len, nh, d_qk})->permute({1, 0, 2}),
+                           full_k_view->permute({1, 2, 0}),
+                           1.f / float(sqrt(d_qk)), 0.f, nullptr, nullptr);
+                    
+                    causalSoftmax(attn_score_req, attn_score_req);
+                    
+                    auto attn_val_req = attn_val_buf->slice(1, 0, seq_len)->view({nh, seq_len, d_v});
+                    linear(attn_val_req, attn_score_req, full_v_req->permute({1, 0, 2}), 1.f, 0.f, nullptr, nullptr);
+                    
+                    auto o_req = o_buf->slice({{0, token_offset, seq_len}})->view({seq_len, nh, d_v});
+                    rearrange(o_req, attn_val_req->permute({1, 0, 2}));
+
+                    current_offset += total_len;
+                    token_offset += seq_len;
+                }
             }
         }
 
