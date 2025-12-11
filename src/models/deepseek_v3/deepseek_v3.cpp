@@ -351,10 +351,12 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                            weights->w_layers[layer].mla->kv_b_proj->z, 1.0, 0.0, nullptr, nullptr);
 
             // Batched Attention Preparation
-            auto padded_k = ws->padded_k_buf->slice(0, 0, nreq);
-            auto padded_v = ws->padded_v_buf->slice(0, 0, nreq);
+            // Slice to current max_total_len to ensure view() works correctly
+            auto padded_k = ws->padded_k_buf->slice(0, 0, nreq)->slice(1, 0, max_total_len);
+            auto padded_v = ws->padded_v_buf->slice(0, 0, nreq)->slice(1, 0, max_total_len);
             auto batched_q = ws->batched_q_buf->slice(0, 0, nreq);
-            auto attn_mask = ws->attn_mask_buf->slice(0, 0, nreq);
+            // Use a fresh contiguous buffer for mask to simplify CPU->GPU copy
+            auto attn_mask = Tensor::buffer(dt_logits, {nreq, 1, 1, max_total_len}, rsrc.memory_pool);
 
             current_offset = 0;
             token_offset = 0;
