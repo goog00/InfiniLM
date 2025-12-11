@@ -392,19 +392,29 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                     auto padded_k_rot = padded_k_req->slice(2, d_nope, d_rope);
                     
                     // Sources are [L, H, D], need to permute to [H, L, D]
-                    rearrange(padded_k_pass, kv_b_req->slice(1, 0, nh * d_nope)->view({total_len, nh, d_nope})->permute({1, 0, 2}));
-                    
+                    // Use loop to avoid complex permute descriptors
+                    auto kv_b_pass = kv_b_req->slice(1, 0, nh * d_nope)->view({total_len, nh, d_nope});
+                    for (size_t h = 0; h < nh; ++h) {
+                        auto dst = padded_k_pass->slice(0, h, 1)->view({total_len, d_nope});
+                        auto src = kv_b_pass->slice(1, h, 1)->view({total_len, d_nope});
+                        rearrange(dst, src);
+                    }
+
                     // Broadcast k_rot [L, D_R] -> [H, L, D_R]
-                    // Workaround for 0-stride broadcast failure: loop over heads
                     for (size_t h = 0; h < nh; ++h) {
                         auto dst_h = padded_k_rot->slice(0, h, 1)->view({total_len, d_rope});
                         rearrange(dst_h, k_rot_cache);
                     }
                     
                     // Assemble Padded V [Req, H, L, D]
-                    auto padded_v_req = padded_v->slice(0, req, 1)->view({nh, max_total_len, d_v})->slice(0, 0, total_len);
-                    auto full_v_req = kv_b_req->slice(1, nh * d_nope, nh * d_v);
-                    rearrange(padded_v_req, full_v_req->view({total_len, nh, d_v})->permute({1, 0, 2}));
+                    auto padded_v_req = padded_v->slice(0, req, 1)->view({nh, max_total_len, d_v})->slice(1, 0, total_len);
+                    auto full_v_req = kv_b_req->slice(1, nh * d_nope, nh * d_v)->view({total_len, nh, d_v});
+                    
+                    for (size_t h = 0; h < nh; ++h) {
+                        auto dst = padded_v_req->slice(0, h, 1)->view({total_len, d_v});
+                        auto src = full_v_req->slice(1, h, 1)->view({total_len, d_v});
+                        rearrange(dst, src);
+                    }
                     
                     // Assemble Batched Q
                     auto q_req = q_buf->slice({{0, token_offset, seq_len}});
