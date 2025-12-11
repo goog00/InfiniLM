@@ -461,10 +461,13 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                     1.f / float(sqrt(d_qk)), 0.f, nullptr, nullptr);
                 
                 // Add Mask
-                add(scores, scores, attn_mask);
+                add(scores->view({nreq, nh, max_total_len}), 
+                    scores->view({nreq, nh, max_total_len}), 
+                    attn_mask->view({nreq, 1, max_total_len}));
                 
                 // Softmax
-                causalSoftmax(scores, scores);
+                causalSoftmax(scores->view({nreq * nh, max_total_len}), 
+                              scores->view({nreq * nh, max_total_len}));
                 
                 // Output: Score * V
                 // Score: [B, H, 1, L]
