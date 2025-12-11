@@ -393,7 +393,13 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                     
                     // Sources are [L, H, D], need to permute to [H, L, D]
                     rearrange(padded_k_pass, kv_b_req->slice(1, 0, nh * d_nope)->view({total_len, nh, d_nope})->permute({1, 0, 2}));
-                    rearrange(padded_k_rot, k_rot_cache->view_as({nh, total_len, d_rope}, {0, ptrdiff_t(d_rope), 1}));
+                    
+                    // Broadcast k_rot [L, D_R] -> [H, L, D_R]
+                    // Workaround for 0-stride broadcast failure: loop over heads
+                    for (size_t h = 0; h < nh; ++h) {
+                        auto dst_h = padded_k_rot->slice(0, h, 1)->view({total_len, d_rope});
+                        rearrange(dst_h, k_rot_cache);
+                    }
                     
                     // Assemble Padded V [Req, H, L, D]
                     auto padded_v_req = padded_v->slice(0, req, 1)->view({nh, max_total_len, d_v})->slice(0, 0, total_len);
