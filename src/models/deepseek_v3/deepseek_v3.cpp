@@ -167,8 +167,8 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
         
         // Only reallocate if actually larger
         if (new_reqs > ws->current_padded_reqs || new_len > ws->current_padded_len) {
-             ws->padded_k_buf = Tensor::buffer(dt_logits, {new_reqs, new_len, nh, d_qk}, rsrc.memory_pool);
-             ws->padded_v_buf = Tensor::buffer(dt_logits, {new_reqs, new_len, nh, d_v}, rsrc.memory_pool);
+             ws->padded_k_buf = Tensor::buffer(dt_logits, {new_reqs, nh, new_len, d_qk}, rsrc.memory_pool);
+             ws->padded_v_buf = Tensor::buffer(dt_logits, {new_reqs, nh, new_len, d_v}, rsrc.memory_pool);
              ws->attn_mask_buf = Tensor::buffer(dt_logits, {new_reqs, 1, 1, new_len}, rsrc.memory_pool);
              ws->attn_mask_cpu.resize(new_reqs * new_len);
              ws->batched_q_buf = Tensor::buffer(dt_logits, {new_reqs, 1, nh, d_qk}, rsrc.memory_pool);
@@ -369,8 +369,10 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
             if (is_pure_decode) {
                 // Batched Attention Preparation (Optimized for Decode)
                 // Slice to current max_total_len to ensure view() works correctly
-                auto padded_k = ws->padded_k_buf->slice(0, 0, nreq)->slice(1, 0, max_total_len);
-                auto padded_v = ws->padded_v_buf->slice(0, 0, nreq)->slice(1, 0, max_total_len);
+                // padded_k: [nreq, nh, max_total_len, d_qk]
+                auto padded_k = ws->padded_k_buf->slice(0, 0, nreq)->slice(2, 0, max_total_len);
+                // padded_v: [nreq, nh, max_total_len, d_v]
+                auto padded_v = ws->padded_v_buf->slice(0, 0, nreq)->slice(2, 0, max_total_len);
                 auto batched_q = ws->batched_q_buf->slice(0, 0, nreq);
                 // Use a fresh contiguous buffer for mask to simplify CPU->GPU copy
                 auto attn_mask = Tensor::buffer(dt_logits, {nreq, 1, 1, max_total_len}, rsrc.memory_pool);
@@ -384,17 +386,19 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                     auto kv_b_req = kv_b_batched->slice(0, current_offset, total_len);
                     auto k_rot_cache = caches[req]->k_rot[idev][layer]->slice(0, 0, total_len);
                     
-                    // Assemble Padded K
-                    auto padded_k_req = padded_k->slice(0, req, 1)->view({max_total_len, nh, d_qk})->slice(0, 0, total_len);
+                    // Assemble Padded K [Req, H, L, D]
+                    auto padded_k_req = padded_k->slice(0, req, 1)->view({nh, max_total_len, d_qk})->slice(1, 0, total_len);
                     auto padded_k_pass = padded_k_req->slice(2, 0, d_nope);
                     auto padded_k_rot = padded_k_req->slice(2, d_nope, d_rope);
-                    rearrange(padded_k_pass, kv_b_req->slice(1, 0, nh * d_nope)->view({total_len, nh, d_nope}));
-                    rearrange(padded_k_rot, k_rot_cache->view_as({total_len, nh, d_rope}, {ptrdiff_t(d_rope), 0, 1}));
                     
-                    // Assemble Padded V
-                    auto padded_v_req = padded_v->slice(0, req, 1)->view({max_total_len, nh, d_v})->slice(0, 0, total_len);
+                    // Sources are [L, H, D], need to permute to [H, L, D]
+                    rearrange(padded_k_pass, kv_b_req->slice(1, 0, nh * d_nope)->view({total_len, nh, d_nope})->permute({1, 0, 2}));
+                    rearrange(padded_k_rot, k_rot_cache->view_as({total_len, nh, d_rope}, {ptrdiff_t(d_rope), 0, 1})->permute({1, 0, 2}));
+                    
+                    // Assemble Padded V [Req, H, L, D]
+                    auto padded_v_req = padded_v->slice(0, req, 1)->view({nh, max_total_len, d_v})->slice(0, 0, total_len);
                     auto full_v_req = kv_b_req->slice(1, nh * d_nope, nh * d_v);
-                    rearrange(padded_v_req, full_v_req->view({total_len, nh, d_v}));
+                    rearrange(padded_v_req, full_v_req->view({total_len, nh, d_v})->permute({1, 0, 2}));
                     
                     // Assemble Batched Q
                     auto q_req = q_buf->slice({{0, token_offset, seq_len}});
@@ -428,14 +432,16 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                 } else {
                     RUN_INFINI(infinirtMemcpyAsync(attn_mask->data(), ws->attn_mask_cpu.data(), 
                                             nreq * max_total_len * sizeof(float), INFINIRT_MEMCPY_H2D, stream));
-                }                // Batched Attention Compute
+                }
+
+                // Batched Attention Compute
                 // Q: [B, 1, H, D] -> [B, H, 1, D]
-                // K: [B, L, H, D] -> [B, H, D, L] (Transposed)
+                // K: [B, H, L, D] -> [B, H, D, L] (Transposed)
                 // Score: [B, H, 1, L]
                 auto scores = Tensor::buffer(dt_logits, {nreq, nh, 1, max_total_len}, rsrc.memory_pool);
                 linear(scores, 
                     batched_q->permute({0, 2, 1, 3}), 
-                    padded_k->permute({0, 2, 3, 1}), 
+                    padded_k->permute({0, 1, 3, 2}), 
                     1.f / float(sqrt(d_qk)), 0.f, nullptr, nullptr);
                 
                 // Add Mask
@@ -446,10 +452,10 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                 
                 // Output: Score * V
                 // Score: [B, H, 1, L]
-                // V: [B, L, H, D] -> [B, H, L, D]
+                // V: [B, H, L, D]
                 // Out: [B, H, 1, D]
                 auto output = Tensor::buffer(dt_logits, {nreq, nh, 1, d_v}, rsrc.memory_pool);
-                linear(output, scores, padded_v->permute({0, 2, 1, 3}), 1.f, 0.f, nullptr, nullptr);
+                linear(output, scores, padded_v, 1.f, 0.f, nullptr, nullptr);
                 
                 // Scatter Output
                 token_offset = 0;
