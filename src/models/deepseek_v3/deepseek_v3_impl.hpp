@@ -54,6 +54,10 @@ struct DeepSeekV3Workspace {
     // Layer buffers (max size)
     std::shared_ptr<Tensor> full_k_buf, kv_b_buf, attn_score_buf, attn_val_buf;
     std::shared_ptr<Tensor> kv_b_batched, kv_pass_combined;
+    std::shared_ptr<Tensor> attn_mask_buf;
+    std::vector<float> attn_mask_cpu;
+    std::shared_ptr<Tensor> padded_k_buf, padded_v_buf;
+    std::shared_ptr<Tensor> batched_q_buf;
 
     // MoE buffers
     std::shared_ptr<Tensor> moe_gate_buf, moe_up_buf;
