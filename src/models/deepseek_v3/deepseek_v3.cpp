@@ -473,8 +473,9 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                     expanded_mask->view({expanded_mask->numel()}));
                 
                 // Softmax
-                causalSoftmax(scores->view({nreq * nh, max_total_len}), 
-                              scores->view({nreq * nh, max_total_len}));
+                // Use 3D view [Batch*Head, 1, TotalLen] to satisfy CausalSoftmax requirements
+                causalSoftmax(scores->view({nreq * nh, 1, max_total_len}), 
+                              scores->view({nreq * nh, 1, max_total_len}));
                 
                 // Output: Score * V
                 // Score: [B, H, 1, L]
