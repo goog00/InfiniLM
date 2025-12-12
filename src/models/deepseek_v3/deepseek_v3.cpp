@@ -457,15 +457,6 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                     padded_k->permute({0, 1, 3, 2})->view({nreq * nh, d_qk, max_total_len}), 
                     1.f / float(sqrt(d_qk)), 0.f, nullptr, nullptr);
                 
-                // Add Mask
-                // Explicitly broadcast mask to avoid backend descriptor errors
-                auto expanded_mask = Tensor::buffer(dt_logits, {nreq, nh, 1, max_total_len}, rsrc.memory_pool);
-                // Use stride 0 broadcast
-                rearrange(expanded_mask, attn_mask->view_as(
-                    {nreq, nh, 1, max_total_len}, 
-                    {ptrdiff_t(max_total_len), 0, ptrdiff_t(max_total_len), 1}
-                ));
-                
                 // Perform add on flattened tensors to ensure compatibility
                 add(scores->view({scores->numel()}), 
                     scores->view({scores->numel()}), 
