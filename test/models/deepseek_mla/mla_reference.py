@@ -219,18 +219,25 @@ class MLA(nn.Module):
         
         # ----- Absorb Mode Attention -----
         # Get wkv_b weight for absorption
+        # wkv_b.weight: [n_heads * (qk_nope + v), kv_lora_rank]
+        # In naive mode: k_nope = kv_cache @ wkv_b.T (for the k_nope part)
+        # So: q_nope @ k_nope.T = q_nope @ (kv_cache @ wkv_b.T).T = q_nope @ wkv_b @ kv_cache.T
+        # For absorb: q_absorbed = q_nope @ wkv_b[:qk_nope_head_dim, :].T
+        
         wkv_b = self.wkv_b.weight  # [n_heads * (qk_nope + v), kv_lora_rank]
-        wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
+        wkv_b = wkv_b.view(self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
         # wkv_b shape: [n_heads, qk_nope + v_head_dim, kv_lora_rank]
         
         # Absorb wkv_b into q_nope for efficient computation
         # q_nope: [batch, seq, n_heads, qk_nope_head_dim]
         # wkv_b[:, :qk_nope_head_dim]: [n_heads, qk_nope_head_dim, kv_lora_rank]
+        # We need: q_nope @ wkv_b[:, :qk_nope].T @ kv.T = q_absorbed @ kv.T
+        # So q_absorbed = q_nope @ wkv_b[:, :qk_nope]  (note: no transpose needed in einsum)
         # Result: [batch, seq, n_heads, kv_lora_rank]
-        q_nope = torch.einsum(
+        q_nope_absorbed = torch.einsum(
             "bshd,hdc->bshc", 
             q_nope, 
-            wkv_b[:, :self.qk_nope_head_dim]
+            wkv_b[:, :self.qk_nope_head_dim, :]
         )
         
         # Update cache
@@ -238,10 +245,10 @@ class MLA(nn.Module):
         
         # ----- Compute Attention Scores -----
         # Two-part attention score:
-        # 1. q_nope @ kv_cache: [batch, seq, n_heads, kv_lora_rank] @ [batch, total_len, kv_lora_rank]
-        # 2. q_pe @ pe_cache: [batch, seq, n_heads, rope_dim] @ [batch, total_len, rope_dim]
+        # 1. q_nope_absorbed @ kv_cache.T: [batch, seq, n_heads, kv_lora_rank] @ [batch, kv_lora_rank, total_len]
+        # 2. q_pe @ pe_cache.T: [batch, seq, n_heads, rope_dim] @ [batch, rope_dim, total_len]
         
-        scores_nope = torch.einsum("bshc,btc->bsht", q_nope, kv_cache)
+        scores_nope = torch.einsum("bshc,btc->bsht", q_nope_absorbed, kv_cache)
         scores_pe = torch.einsum("bshr,btr->bsht", q_pe, pe_cache)
         scores = (scores_nope + scores_pe) * self.softmax_scale
         
@@ -253,22 +260,24 @@ class MLA(nn.Module):
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
         
         # ----- Compute Output -----
-        # Weighted sum over kv_cache
+        # Weighted sum over kv_cache (absorb mode)
         # scores: [batch, seq, n_heads, total_len]
         # kv_cache: [batch, total_len, kv_lora_rank]
         # Result: [batch, seq, n_heads, kv_lora_rank]
-        x = torch.einsum("bsht,btc->bshc", scores, kv_cache)
+        output = torch.einsum("bsht,btc->bshc", scores, kv_cache)
         
         # Apply wkv_b for value projection
-        # x: [batch, seq, n_heads, kv_lora_rank]
+        # In naive: output = scores @ v, where v = kv @ wkv_b[:, qk_nope:].T
+        # In absorb: output = (scores @ kv) @ wkv_b[:, qk_nope:].T
+        # output: [batch, seq, n_heads, kv_lora_rank]
         # wkv_b[:, -v_head_dim:]: [n_heads, v_head_dim, kv_lora_rank]
         # Result: [batch, seq, n_heads, v_head_dim]
-        x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
+        output = torch.einsum("bshc,hdc->bshd", output, wkv_b[:, -self.v_head_dim:, :])
         
         # Flatten heads and apply output projection
-        x = self.wo(x.flatten(2))
+        output = self.wo(output.flatten(2))
         
-        return x
+        return output
 
 
 class MLAWithNaiveCache(nn.Module):
