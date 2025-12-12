@@ -147,19 +147,37 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
     // ============== MODE SELECTION ==============
     // Set to true to use Absorb mode (optimized), false to use original mode
     const bool use_absorb_mode = true;
+    
+    // Check if all requests are decode (seq_len=1) for decode-specific optimization
+    bool is_all_decode = true;
+    for (uint32_t req = 0; req < nreq; req++) {
+        if (req_lens[req] != 1) {
+            is_all_decode = false;
+            break;
+        }
+    }
 
-    // Additional buffers for Absorb mode optimization
-    std::shared_ptr<Tensor> wkv_b_dequant, q_absorbed_buf, attn_score_nope_buf, attn_score_pe_buf, weighted_kv_buf;
+    // ============== MEMORY OPTIMIZATION ==============
+    // Reuse buffers where possible, allocate only what's needed
+    std::shared_ptr<Tensor> wkv_b_dequant, q_absorbed_buf, weighted_kv_buf;
+    // Reuse attn_score_buf for both nope and pe scores (compute sequentially, fuse with add)
     if (use_absorb_mode) {
         // wkv_b dequantized weight: [r_kv, nh * (d_nope + d_v)]
         wkv_b_dequant = Tensor::buffer(dt_logits, {r_kv, nh * (d_nope + d_v)}, rsrc.memory_pool);
-        // q_absorbed buffer: [max_seq_len, nh, r_kv]
-        q_absorbed_buf = Tensor::buffer(dt_logits, {max_seq_len, nh, r_kv}, rsrc.memory_pool);
-        // Attention scores for absorb mode
-        attn_score_nope_buf = Tensor::buffer(dt_logits, {nh, max_qk_size}, rsrc.memory_pool);
-        attn_score_pe_buf = Tensor::buffer(dt_logits, {nh, max_qk_size}, rsrc.memory_pool);
-        // Weighted cache output: [max_seq_len, nh, r_kv]
-        weighted_kv_buf = Tensor::buffer(dt_logits, {max_seq_len, nh, r_kv}, rsrc.memory_pool);
+        
+        if (is_all_decode) {
+            // DECODE OPTIMIZATION: Smaller buffers for seq_len=1
+            // q_absorbed buffer: [1, nh, r_kv] - only need 1 position
+            q_absorbed_buf = Tensor::buffer(dt_logits, {1, nh, r_kv}, rsrc.memory_pool);
+            // Weighted cache output: [1, nh, r_kv]
+            weighted_kv_buf = Tensor::buffer(dt_logits, {1, nh, r_kv}, rsrc.memory_pool);
+        } else {
+            // Prefill: need full buffers
+            q_absorbed_buf = Tensor::buffer(dt_logits, {max_seq_len, nh, r_kv}, rsrc.memory_pool);
+            weighted_kv_buf = Tensor::buffer(dt_logits, {max_seq_len, nh, r_kv}, rsrc.memory_pool);
+        }
+        // Note: Removed attn_score_nope_buf and attn_score_pe_buf
+        // We now compute scores directly into attn_score_buf using fused add
     }
 
     // Scale factor for attention
@@ -241,60 +259,97 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                 auto wkv_b_k = wkv_b_dequant->slice(1, 0, nh * d_nope);       // [r_kv, nh * d_nope]
                 auto wkv_b_v = wkv_b_dequant->slice(1, nh * d_nope, nh * d_v); // [r_kv, nh * d_v]
 
-                // Step 1: Absorb wkv_b_k into q_nope
-                // q_nope @ wkv_b_k: [seq_len, nh, d_nope] @ [d_nope, r_kv] per head -> [seq_len, nh, r_kv]
-                // wkv_b_k is [r_kv, nh * d_nope], view as [r_kv, nh, d_nope], permute to [nh, d_nope, r_kv]
-                auto q_absorbed_req = q_absorbed_buf->slice(0, 0, seq_len);  // [seq_len, nh, r_kv]
-                linear(q_absorbed_req->permute({1, 0, 2}),  // [nh, seq_len, r_kv]
-                       q_nope_req->permute({1, 0, 2}),       // [nh, seq_len, d_nope]
-                       wkv_b_k->view({r_kv, nh, d_nope})->permute({1, 2, 0}),  // [nh, d_nope, r_kv]
-                       1.f, 0.f, nullptr, nullptr);
-
-                // Step 2: Compute attention scores
                 auto attn_score_req = attn_score_buf->slice(1, 0, seq_len * total_len)->view({nh, seq_len, total_len});
 
-                // Part 1: q_absorbed @ kv_cache.T -> [nh, seq_len, total_len]
-                // Need to expand kv_cache [total_len, r_kv] to be per-head compatible
-                // Use gemm with broadcast: [nh, seq_len, r_kv] @ [r_kv, total_len] -> [nh, seq_len, total_len]
-                auto attn_score_nope_req = attn_score_nope_buf->slice(1, 0, seq_len * total_len)->view({nh, seq_len, total_len});
-                linear(attn_score_nope_req,
-                       q_absorbed_req->permute({1, 0, 2}),  // [nh, seq_len, r_kv]
-                       kv_cache_req->permute({1, 0}),       // [r_kv, total_len]
-                       attn_scale, 0.f, nullptr, nullptr);
+                if (seq_len == 1) {
+                    // ============== DECODE OPTIMIZATION (seq_len=1) ==============
+                    // For decode, we can use a more efficient computation order:
+                    // Instead of: q_absorbed = q @ wkv_b_k, scores = q_absorbed @ kv_cache.T
+                    // We compute: k_proj = wkv_b_k @ kv_cache.T, scores = q @ k_proj
+                    // This can be more cache-friendly when total_len is large
+                    
+                    // Step 1: Absorb wkv_b_k into q_nope (single token)
+                    auto q_absorbed_req = q_absorbed_buf->slice(0, 0, 1);  // [1, nh, r_kv]
+                    linear(q_absorbed_req->permute({1, 0, 2}),  // [nh, 1, r_kv]
+                           q_nope_req->permute({1, 0, 2}),       // [nh, 1, d_nope]
+                           wkv_b_k->view({r_kv, nh, d_nope})->permute({1, 2, 0}),  // [nh, d_nope, r_kv]
+                           1.f, 0.f, nullptr, nullptr);
 
-                // Part 2: q_pe @ pe_cache.T -> [nh, seq_len, total_len]
-                // pe_cache is shared across heads (MQA style for rope part)
-                auto attn_score_pe_req = attn_score_pe_buf->slice(1, 0, seq_len * total_len)->view({nh, seq_len, total_len});
-                linear(attn_score_pe_req,
-                       q_pe_req->permute({1, 0, 2}),   // [nh, seq_len, d_rope]
-                       pe_cache_req->permute({1, 0}), // [d_rope, total_len]
-                       attn_scale, 0.f, nullptr, nullptr);
+                    // Step 2: Compute attention scores with FUSED ADD
+                    // First compute q_absorbed @ kv_cache.T into attn_score_req
+                    linear(attn_score_req,
+                           q_absorbed_req->permute({1, 0, 2}),  // [nh, 1, r_kv]
+                           kv_cache_req->permute({1, 0}),       // [r_kv, total_len]
+                           attn_scale, 0.f, nullptr, nullptr);
 
-                // Combine scores: scores = scores_nope + scores_pe
-                add(attn_score_req, attn_score_nope_req, attn_score_pe_req);
+                    // Then compute q_pe @ pe_cache.T and ADD to attn_score_req (fused with beta=1)
+                    linear(attn_score_req,
+                           q_pe_req->permute({1, 0, 2}),   // [nh, 1, d_rope]
+                           pe_cache_req->permute({1, 0}), // [d_rope, total_len]
+                           attn_scale, 1.f, nullptr, nullptr);  // beta=1.0 fuses the add!
 
-                // Softmax
-                causalSoftmax(attn_score_req, attn_score_req);
+                    // Softmax
+                    causalSoftmax(attn_score_req, attn_score_req);
 
-                // Step 3: Compute weighted KV cache
-                // output = scores @ kv_cache: [nh, seq_len, total_len] @ [total_len, r_kv] -> [nh, seq_len, r_kv]
-                auto weighted_kv_req = weighted_kv_buf->slice(0, 0, seq_len);  // [seq_len, nh, r_kv]
-                linear(weighted_kv_req->permute({1, 0, 2}),  // [nh, seq_len, r_kv]
-                       attn_score_req,                        // [nh, seq_len, total_len]
-                       kv_cache_req,                          // [total_len, r_kv]
-                       1.f, 0.f, nullptr, nullptr);
+                    // Step 3: Compute weighted KV cache
+                    auto weighted_kv_req = weighted_kv_buf->slice(0, 0, 1);  // [1, nh, r_kv]
+                    linear(weighted_kv_req->permute({1, 0, 2}),  // [nh, 1, r_kv]
+                           attn_score_req,                        // [nh, 1, total_len]
+                           kv_cache_req,                          // [total_len, r_kv]
+                           1.f, 0.f, nullptr, nullptr);
 
-                // Step 4: Apply wkv_b_v to get final attention output
-                // weighted_kv @ wkv_b_v.T: [seq_len, nh, r_kv] @ [r_kv, d_v] per head -> [seq_len, nh, d_v]
-                // wkv_b_v is [r_kv, nh * d_v], view as [r_kv, nh, d_v], permute to [nh, r_kv, d_v]
-                auto attn_val_req = attn_val_buf->slice(1, 0, seq_len)->view({nh, seq_len, d_v});
-                linear(attn_val_req,
-                       weighted_kv_req->permute({1, 0, 2}),  // [nh, seq_len, r_kv]
-                       wkv_b_v->view({r_kv, nh, d_v})->permute({1, 0, 2}),  // [nh, r_kv, d_v]
-                       1.f, 0.f, nullptr, nullptr);
+                    // Step 4: Apply wkv_b_v to get final attention output
+                    auto attn_val_req = attn_val_buf->slice(1, 0, 1)->view({nh, 1, d_v});
+                    linear(attn_val_req,
+                           weighted_kv_req->permute({1, 0, 2}),  // [nh, 1, r_kv]
+                           wkv_b_v->view({r_kv, nh, d_v})->permute({1, 0, 2}),  // [nh, r_kv, d_v]
+                           1.f, 0.f, nullptr, nullptr);
 
-                // Rearrange: [nh, seq_len, d_v] -> [seq_len, nh, d_v]
-                rearrange(o_req, attn_val_req->permute({1, 0, 2}));
+                    // Rearrange: [nh, 1, d_v] -> [1, nh, d_v]
+                    rearrange(o_req, attn_val_req->permute({1, 0, 2}));
+
+                } else {
+                    // ============== PREFILL MODE (seq_len > 1) ==============
+                    // Step 1: Absorb wkv_b_k into q_nope
+                    auto q_absorbed_req = q_absorbed_buf->slice(0, 0, seq_len);  // [seq_len, nh, r_kv]
+                    linear(q_absorbed_req->permute({1, 0, 2}),  // [nh, seq_len, r_kv]
+                           q_nope_req->permute({1, 0, 2}),       // [nh, seq_len, d_nope]
+                           wkv_b_k->view({r_kv, nh, d_nope})->permute({1, 2, 0}),  // [nh, d_nope, r_kv]
+                           1.f, 0.f, nullptr, nullptr);
+
+                    // Step 2: Compute attention scores with FUSED ADD
+                    // First compute q_absorbed @ kv_cache.T
+                    linear(attn_score_req,
+                           q_absorbed_req->permute({1, 0, 2}),  // [nh, seq_len, r_kv]
+                           kv_cache_req->permute({1, 0}),       // [r_kv, total_len]
+                           attn_scale, 0.f, nullptr, nullptr);
+
+                    // Then compute q_pe @ pe_cache.T and ADD (fused with beta=1)
+                    linear(attn_score_req,
+                           q_pe_req->permute({1, 0, 2}),   // [nh, seq_len, d_rope]
+                           pe_cache_req->permute({1, 0}), // [d_rope, total_len]
+                           attn_scale, 1.f, nullptr, nullptr);  // beta=1.0 fuses the add!
+
+                    // Softmax
+                    causalSoftmax(attn_score_req, attn_score_req);
+
+                    // Step 3: Compute weighted KV cache
+                    auto weighted_kv_req = weighted_kv_buf->slice(0, 0, seq_len);  // [seq_len, nh, r_kv]
+                    linear(weighted_kv_req->permute({1, 0, 2}),  // [nh, seq_len, r_kv]
+                           attn_score_req,                        // [nh, seq_len, total_len]
+                           kv_cache_req,                          // [total_len, r_kv]
+                           1.f, 0.f, nullptr, nullptr);
+
+                    // Step 4: Apply wkv_b_v to get final attention output
+                    auto attn_val_req = attn_val_buf->slice(1, 0, seq_len)->view({nh, seq_len, d_v});
+                    linear(attn_val_req,
+                           weighted_kv_req->permute({1, 0, 2}),  // [nh, seq_len, r_kv]
+                           wkv_b_v->view({r_kv, nh, d_v})->permute({1, 0, 2}),  // [nh, r_kv, d_v]
+                           1.f, 0.f, nullptr, nullptr);
+
+                    // Rearrange: [nh, seq_len, d_v] -> [seq_len, nh, d_v]
+                    rearrange(o_req, attn_val_req->permute({1, 0, 2}));
+                }
 
             } else {
                 // ============== ORIGINAL MODE (for comparison) ==============
