@@ -713,6 +713,35 @@ def main():
         # Memory comparison
         if hasattr(torch.cuda, 'max_memory_allocated'):
             print(f"\nPeak GPU Memory: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB")
+        
+        # Cache memory comparison
+        print(f"\nCache Memory Comparison (per token per layer, BF16):")
+        absorb_cache_bytes = (config.kv_lora_rank + config.qk_rope_head_dim) * 2  # kv_cache + pe_cache
+        naive_cache_bytes = config.n_heads * (config.qk_head_dim + config.v_head_dim) * 2  # k_cache + v_cache
+        print(f"  Absorb Mode: {absorb_cache_bytes} bytes ({config.kv_lora_rank} + {config.qk_rope_head_dim} dims)")
+        print(f"  Naive Mode:  {naive_cache_bytes} bytes ({config.n_heads} * ({config.qk_head_dim} + {config.v_head_dim}) dims)")
+        print(f"  Compression Ratio: {naive_cache_bytes / absorb_cache_bytes:.1f}x")
+        
+        # Theoretical speedup analysis
+        print(f"\n📊 Performance Analysis:")
+        if results_absorb['prefill_latency_ms'] < results_naive['prefill_latency_ms']:
+            prefill_speedup = results_naive['prefill_latency_ms'] / results_absorb['prefill_latency_ms']
+            print(f"  ✓ Prefill: Absorb is {prefill_speedup:.2f}x faster")
+        else:
+            prefill_slowdown = results_absorb['prefill_latency_ms'] / results_naive['prefill_latency_ms']
+            print(f"  ⚠ Prefill: Absorb is {prefill_slowdown:.2f}x slower (expected in PyTorch, fused kernels needed)")
+        
+        if results_absorb['decode_throughput_tok_s'] > results_naive['decode_throughput_tok_s']:
+            decode_speedup = results_absorb['decode_throughput_tok_s'] / results_naive['decode_throughput_tok_s']
+            print(f"  ✓ Decode: Absorb is {decode_speedup:.2f}x faster")
+        else:
+            decode_slowdown = results_naive['decode_throughput_tok_s'] / results_absorb['decode_throughput_tok_s']
+            print(f"  ⚠ Decode: Absorb is {decode_slowdown:.2f}x slower (expected in PyTorch, fused kernels needed)")
+        
+        print(f"\n💡 Note: Absorb mode benefits from:")
+        print(f"   1. {naive_cache_bytes / absorb_cache_bytes:.1f}x smaller KV cache (critical for long contexts)")
+        print(f"   2. Fused CUDA kernels (not available in pure PyTorch)")
+        print(f"   3. Lower memory bandwidth for cache reads")
     
     print("\n" + "*" * 80)
     print("Test Complete!")

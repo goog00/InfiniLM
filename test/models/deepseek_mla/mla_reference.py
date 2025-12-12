@@ -220,36 +220,38 @@ class MLA(nn.Module):
         # ----- Absorb Mode Attention -----
         # Get wkv_b weight for absorption
         # wkv_b.weight: [n_heads * (qk_nope + v), kv_lora_rank]
-        # In naive mode: k_nope = kv_cache @ wkv_b.T (for the k_nope part)
-        # So: q_nope @ k_nope.T = q_nope @ (kv_cache @ wkv_b.T).T = q_nope @ wkv_b @ kv_cache.T
-        # For absorb: q_absorbed = q_nope @ wkv_b[:qk_nope_head_dim, :].T
-        
         wkv_b = self.wkv_b.weight  # [n_heads * (qk_nope + v), kv_lora_rank]
         wkv_b = wkv_b.view(self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
         # wkv_b shape: [n_heads, qk_nope + v_head_dim, kv_lora_rank]
         
-        # Absorb wkv_b into q_nope for efficient computation
+        # Split wkv_b into k and v parts
+        wkv_b_k = wkv_b[:, :self.qk_nope_head_dim, :]  # [n_heads, qk_nope, kv_lora_rank]
+        wkv_b_v = wkv_b[:, -self.v_head_dim:, :]       # [n_heads, v_head_dim, kv_lora_rank]
+        
+        # Absorb wkv_b_k into q_nope using batched matmul (more efficient than einsum)
         # q_nope: [batch, seq, n_heads, qk_nope_head_dim]
-        # wkv_b[:, :qk_nope_head_dim]: [n_heads, qk_nope_head_dim, kv_lora_rank]
-        # We need: q_nope @ wkv_b[:, :qk_nope].T @ kv.T = q_absorbed @ kv.T
-        # So q_absorbed = q_nope @ wkv_b[:, :qk_nope]  (note: no transpose needed in einsum)
+        # wkv_b_k: [n_heads, qk_nope_head_dim, kv_lora_rank]
         # Result: [batch, seq, n_heads, kv_lora_rank]
-        q_nope_absorbed = torch.einsum(
-            "bshd,hdc->bshc", 
-            q_nope, 
-            wkv_b[:, :self.qk_nope_head_dim, :]
-        )
+        q_nope_t = q_nope.permute(0, 2, 1, 3)  # [batch, n_heads, seq, qk_nope]
+        q_nope_absorbed = torch.matmul(q_nope_t, wkv_b_k)  # [batch, n_heads, seq, kv_lora_rank]
         
         # Update cache
         kv_cache, pe_cache = self.update_cache(kv, k_pe, start_pos)
         
         # ----- Compute Attention Scores -----
-        # Two-part attention score:
-        # 1. q_nope_absorbed @ kv_cache.T: [batch, seq, n_heads, kv_lora_rank] @ [batch, kv_lora_rank, total_len]
-        # 2. q_pe @ pe_cache.T: [batch, seq, n_heads, rope_dim] @ [batch, rope_dim, total_len]
+        # Use batched matmul instead of einsum for efficiency
+        # q_nope_absorbed: [batch, n_heads, seq, kv_lora_rank]
+        # kv_cache: [batch, total_len, kv_lora_rank]
+        # scores_nope = q_nope_absorbed @ kv_cache.T
+        kv_cache_t = kv_cache.unsqueeze(1).transpose(-2, -1)  # [batch, 1, kv_lora_rank, total_len]
+        scores_nope = torch.matmul(q_nope_absorbed, kv_cache_t)  # [batch, n_heads, seq, total_len]
         
-        scores_nope = torch.einsum("bshc,btc->bsht", q_nope_absorbed, kv_cache)
-        scores_pe = torch.einsum("bshr,btr->bsht", q_pe, pe_cache)
+        # q_pe: [batch, seq, n_heads, rope_dim]
+        # pe_cache: [batch, total_len, rope_dim]
+        q_pe_t = q_pe.permute(0, 2, 1, 3)  # [batch, n_heads, seq, rope_dim]
+        pe_cache_t = pe_cache.unsqueeze(1).transpose(-2, -1)  # [batch, 1, rope_dim, total_len]
+        scores_pe = torch.matmul(q_pe_t, pe_cache_t)  # [batch, n_heads, seq, total_len]
+        
         scores = (scores_nope + scores_pe) * self.softmax_scale
         
         # Apply mask if provided
@@ -260,19 +262,20 @@ class MLA(nn.Module):
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
         
         # ----- Compute Output -----
-        # Weighted sum over kv_cache (absorb mode)
-        # scores: [batch, seq, n_heads, total_len]
+        # Weighted sum over kv_cache using batched matmul
+        # scores: [batch, n_heads, seq, total_len]
         # kv_cache: [batch, total_len, kv_lora_rank]
-        # Result: [batch, seq, n_heads, kv_lora_rank]
-        output = torch.einsum("bsht,btc->bshc", scores, kv_cache)
+        kv_cache_exp = kv_cache.unsqueeze(1)  # [batch, 1, total_len, kv_lora_rank]
+        output = torch.matmul(scores, kv_cache_exp)  # [batch, n_heads, seq, kv_lora_rank]
         
-        # Apply wkv_b for value projection
-        # In naive: output = scores @ v, where v = kv @ wkv_b[:, qk_nope:].T
-        # In absorb: output = (scores @ kv) @ wkv_b[:, qk_nope:].T
-        # output: [batch, seq, n_heads, kv_lora_rank]
-        # wkv_b[:, -v_head_dim:]: [n_heads, v_head_dim, kv_lora_rank]
-        # Result: [batch, seq, n_heads, v_head_dim]
-        output = torch.einsum("bshc,hdc->bshd", output, wkv_b[:, -self.v_head_dim:, :])
+        # Apply wkv_b_v for value projection
+        # output: [batch, n_heads, seq, kv_lora_rank]
+        # wkv_b_v: [n_heads, v_head_dim, kv_lora_rank]
+        # Need: output @ wkv_b_v.T -> [batch, n_heads, seq, v_head_dim]
+        output = torch.matmul(output, wkv_b_v.transpose(-2, -1))  # [batch, n_heads, seq, v_head_dim]
+        
+        # Permute back to [batch, seq, n_heads, v_head_dim]
+        output = output.permute(0, 2, 1, 3)
         
         # Flatten heads and apply output projection
         output = self.wo(output.flatten(2))
@@ -370,19 +373,22 @@ class MLAWithNaiveCache(nn.Module):
         self.k_cache[:bsz, start_pos:end_pos] = k
         self.v_cache[:bsz, start_pos:end_pos] = v
         
-        # Standard attention
-        scores = torch.einsum(
-            "bshd,bthd->bsht", 
-            q, 
-            self.k_cache[:bsz, :end_pos]
-        ) * self.softmax_scale
+        # Standard attention using matmul (more efficient than einsum)
+        # q: [batch, seq, n_heads, qk_head_dim]
+        # k_cache: [batch, total_len, n_heads, qk_head_dim]
+        q_t = q.permute(0, 2, 1, 3)  # [batch, n_heads, seq, qk_head_dim]
+        k_t = self.k_cache[:bsz, :end_pos].permute(0, 2, 3, 1)  # [batch, n_heads, qk_head_dim, total_len]
+        scores = torch.matmul(q_t, k_t) * self.softmax_scale  # [batch, n_heads, seq, total_len]
         
         if mask is not None:
             scores = scores + mask.unsqueeze(1)
         
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
         
-        x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
+        # output = scores @ v_cache
+        v_t = self.v_cache[:bsz, :end_pos].permute(0, 2, 1, 3)  # [batch, n_heads, total_len, v_head_dim]
+        x = torch.matmul(scores, v_t)  # [batch, n_heads, seq, v_head_dim]
+        x = x.permute(0, 2, 1, 3)  # [batch, seq, n_heads, v_head_dim]
         x = self.wo(x.flatten(2))
         
         return x
