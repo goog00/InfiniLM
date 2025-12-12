@@ -4,12 +4,196 @@ import time
 import torch
 import torch.nn.functional as F
 
-# When invoked as `python test/.../mla_test.py` (not `-m`),
-# Python won't treat `test` as an importable top-level package.
-# Ensure repo root is on sys.path for consistent imports.
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../"))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
+def _maybe_add_repo_root_to_syspath():
+    """Make `test.models...` importable for both `python .../mla_test.py` and `python -m ...`.
+
+    Under schedulers (e.g. `srun`) the working directory can differ; this function ensures
+    we still find the InfiniLM repo root.
+    """
+
+    def looks_like_repo_root(path: str) -> bool:
+        return os.path.exists(os.path.join(path, "pyproject.toml")) and os.path.exists(
+            os.path.join(path, "test")
+        )
+
+    candidates = []
+    # 1) Directory derived from this file location
+    candidates.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../")))
+    # 2) Current working directory (common when running from repo root)
+    candidates.append(os.path.abspath(os.getcwd()))
+    # 3) Walk up from cwd a few levels
+    cur = os.path.abspath(os.getcwd())
+    for _ in range(6):
+        candidates.append(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+    for cand in candidates:
+        if looks_like_repo_root(cand) and cand not in sys.path:
+            sys.path.insert(0, cand)
+            return
+
+
+_maybe_add_repo_root_to_syspath()
+
+
+# --------------------------------------------------------------------------------------
+# Self-contained PyTorch reference MLA (for correctness baseline)
+# --------------------------------------------------------------------------------------
+
+
+class DeepSeekV3Config:
+    """Minimal config needed by the reference MLA.
+
+    Defaults match the prototype previously used in this repo; override from config.json when available.
+    """
+
+    def __init__(self, model_path: str | None = None):
+        self.hidden_size = 2048
+        self.num_heads = 16
+        self.num_kv_heads = 16
+        self.rope_dim = 64
+        self.nope_dim = 128
+        self.q_lora_rank = 128
+        self.kv_lora_rank = 128
+        self.qk_head_dim = self.rope_dim + self.nope_dim
+        self.v_head_dim = 128
+        self.rms_norm_eps = 1e-6
+
+        if model_path:
+            self.load_from_json(model_path)
+
+    def load_from_json(self, model_path: str):
+        config_path = os.path.join(model_path, "config.json")
+        if not os.path.exists(config_path):
+            print(f"Warning: config.json not found at {config_path}; using defaults.")
+            return
+        import json
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+
+        self.hidden_size = cfg.get("hidden_size", self.hidden_size)
+        self.num_heads = cfg.get("num_attention_heads", self.num_heads)
+        self.num_kv_heads = cfg.get("num_key_value_heads", self.num_kv_heads)
+        self.rope_dim = cfg.get("rope_dim", self.rope_dim)
+        self.nope_dim = cfg.get("nope_dim", self.nope_dim)
+        self.q_lora_rank = cfg.get("q_lora_rank", self.q_lora_rank)
+        self.kv_lora_rank = cfg.get("kv_lora_rank", self.kv_lora_rank)
+        self.v_head_dim = cfg.get("v_head_dim", self.v_head_dim)
+        self.rms_norm_eps = cfg.get("rms_norm_eps", self.rms_norm_eps)
+        self.qk_head_dim = self.rope_dim + self.nope_dim
+
+
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        xf = x.float()
+        var = xf.pow(2).mean(-1, keepdim=True)
+        xf = xf * torch.rsqrt(var + self.eps)
+        return (xf * self.weight.float()).to(dtype)
+
+
+class DeepSeekV3MLA(torch.nn.Module):
+    """Reference MLA with kv_cache + pe_cache.
+
+    This is for correctness/perf baseline only (not optimized).
+    Cache shapes:
+    - kv_cache: (bs, past_len, r_kv)
+    - pe_cache: (bs, past_len, d_rope)
+    """
+
+    def __init__(self, config: DeepSeekV3Config):
+        super().__init__()
+        self.config = config
+        self.d = config.hidden_size
+        self.nh = config.num_heads
+        self.d_rope = config.rope_dim
+        self.d_nope = config.nope_dim
+        self.r_q = config.q_lora_rank
+        self.r_kv = config.kv_lora_rank
+        self.d_qk = config.qk_head_dim
+        self.d_v = config.v_head_dim
+
+        self.mla_norm = RMSNorm(self.d, config.rms_norm_eps)
+        self.q_a_norm = RMSNorm(self.r_q, config.rms_norm_eps)
+        self.kv_a_norm = RMSNorm(self.r_kv, config.rms_norm_eps)
+
+        self.q_a_proj = torch.nn.Linear(self.d, self.r_q, bias=False)
+        self.q_b_proj = torch.nn.Linear(self.r_q, self.nh * self.d_qk, bias=False)
+        self.kv_a_proj = torch.nn.Linear(self.d, self.r_kv + self.d_rope, bias=False)
+        self.kv_b_proj = torch.nn.Linear(self.r_kv, self.nh * (self.d_nope + self.d_v), bias=False)
+        self.o_proj = torch.nn.Linear(self.nh * self.d_v, self.d, bias=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        past_kv_cache: torch.Tensor | None,
+        past_pe_cache: torch.Tensor | None,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor] | None,
+    ):
+        batch_size, seq_len, _ = x.shape
+        norm_x = self.mla_norm(x)
+
+        q_a = self.q_a_proj(norm_x)
+        q_a = self.q_a_norm(q_a)
+        q = self.q_b_proj(q_a).view(batch_size, seq_len, self.nh, self.d_qk)
+
+        q_nope = q[..., : self.d_nope]
+        q_rope = q[..., self.d_nope :]
+        if freqs_cis is not None:
+            cos, sin = freqs_cis
+            q_rope = apply_rotary_emb(q_rope, cos, sin)
+        q = torch.cat([q_nope, q_rope], dim=-1)
+
+        kv_a = self.kv_a_proj(norm_x)
+        kv_pass = kv_a[..., : self.r_kv]
+        k_rot = kv_a[..., self.r_kv :]
+        kv_pass = self.kv_a_norm(kv_pass)
+        if freqs_cis is not None:
+            cos, sin = freqs_cis
+            k_rot = apply_rotary_emb(k_rot.unsqueeze(2), cos, sin).squeeze(2)
+
+        if past_kv_cache is not None:
+            kv_pass = torch.cat([past_kv_cache, kv_pass], dim=1)
+        if past_pe_cache is not None:
+            k_rot = torch.cat([past_pe_cache, k_rot], dim=1)
+
+        total_seq_len = kv_pass.shape[1]
+        current_kv_cache = kv_pass
+        current_pe_cache = k_rot
+
+        kv_b = self.kv_b_proj(kv_pass).view(batch_size, total_seq_len, self.nh, self.d_nope + self.d_v)
+        k_nope = kv_b[..., : self.d_nope]
+        v = kv_b[..., self.d_nope :]
+
+        k_rot_expanded = k_rot.unsqueeze(2).expand(-1, -1, self.nh, -1)
+        k = torch.cat([k_nope, k_rot_expanded], dim=-1)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_qk**0.5)
+        if seq_len > 1:
+            mask = torch.triu(
+                torch.ones(seq_len, total_seq_len, device=x.device), diagonal=1 + (total_seq_len - seq_len)
+            ).bool()
+            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+        attn = F.softmax(scores.float(), dim=-1).to(v.dtype)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.nh * self.d_v)
+        out = self.o_proj(out)
+        return out, current_kv_cache, current_pe_cache
 
 # Keep consistent with existing attention tests
 WARMUPS = 10
@@ -348,19 +532,7 @@ def main():
 
     torch.manual_seed(args.seed)
 
-    # Import your reference MLA from existing mla_test1.py to keep consistent with in-repo prototype
-    try:
-        from test.models.deepseek_mla.mla_test1 import DeepSeekV3Config, DeepSeekV3MLA
-    except ModuleNotFoundError as e:
-        raise SystemExit(
-            f"Failed to import reference MLA from test.models.deepseek_mla.mla_test1: {e}. "
-            "Run from repo root or use `python -m test.models.deepseek_mla.mla_test ...`."
-        )
-
     cfg = DeepSeekV3Config(args.model_path)
-    cfg.device = device
-    cfg.dtype = dtype
-
     mla_ref = DeepSeekV3MLA(cfg).to(device=device, dtype=dtype)
     mla_ref.eval()
 
