@@ -1,10 +1,12 @@
 from ....generation.utils import GenerationMixin
 import infinicore
 from infinilm.models.llama.configuration_llama import LlamaConfig as _LlamaConfig
-from infinilm.lib import _infinilm_llama
+from infinilm.lib import _infinilm
+from infinilm.distributed import DistConfig
 import json
 import os
 from typing import Optional, Union
+from collections import OrderedDict
 
 
 class LlamaConfig:
@@ -12,6 +14,9 @@ class LlamaConfig:
 
     This class wraps configuration_llama.LlamaConfig and provides
     a _underlying property that creates the C++ config object.
+
+    Automatically detects and handles both regular Llama models and Jiuge models
+    (fm9g7b, fm9g, minicpm) with appropriate defaults and validation.
     """
 
     def __init__(self, config_dict=None, **kwargs):
@@ -49,7 +54,7 @@ class LlamaConfig:
     def _underlying(self):
         """Get underlying C++ config object, creating it if needed"""
         if self._cpp_config is None:
-            self._cpp_config = _infinilm_llama.LlamaConfig()
+            self._cpp_config = _infinilm.LlamaConfig()
 
             # Copy attributes from Python config to C++ config
             for key in dir(self._python_config):
@@ -62,22 +67,79 @@ class LlamaConfig:
                 except (AttributeError, TypeError):
                     pass
 
-            # Handle defaults
-            if (
-                not hasattr(self._cpp_config, "num_key_value_heads")
-                or self._cpp_config.num_key_value_heads == 0
-            ):
+            # Handle num_key_value_heads with validation
+            python_num_kv_heads = getattr(
+                self._python_config, "num_key_value_heads", None
+            )
+            if python_num_kv_heads is None or python_num_kv_heads == 0:
                 self._cpp_config.num_key_value_heads = (
                     self._cpp_config.num_attention_heads
                 )
+            else:
+                self._cpp_config.num_key_value_heads = python_num_kv_heads
 
-            if (
-                not hasattr(self._cpp_config, "head_dim")
-                or self._cpp_config.head_dim == 0
-            ):
-                self._cpp_config.head_dim = (
-                    self._cpp_config.hidden_size // self._cpp_config.num_attention_heads
+            # Handle head_dim with validation (critical for GEMM operations)
+            python_head_dim = getattr(self._python_config, "head_dim", None)
+            if python_head_dim is None or python_head_dim == 0:
+                # Compute from hidden_size and num_attention_heads
+                if (
+                    self._cpp_config.hidden_size > 0
+                    and self._cpp_config.num_attention_heads > 0
+                ):
+                    computed_head_dim = (
+                        self._cpp_config.hidden_size
+                        // self._cpp_config.num_attention_heads
+                    )
+                    self._cpp_config.head_dim = computed_head_dim
+                else:
+                    raise ValueError(
+                        f"Cannot compute head_dim: hidden_size={self._cpp_config.hidden_size}, "
+                        f"num_attention_heads={self._cpp_config.num_attention_heads}"
+                    )
+            else:
+                # Use from Python config
+                self._cpp_config.head_dim = python_head_dim
+                # Validate it matches expected value (warn but allow for flexibility)
+                if (
+                    self._cpp_config.hidden_size > 0
+                    and self._cpp_config.num_attention_heads > 0
+                ):
+                    expected_head_dim = (
+                        self._cpp_config.hidden_size
+                        // self._cpp_config.num_attention_heads
+                    )
+                    if self._cpp_config.head_dim != expected_head_dim:
+                        import warnings
+
+                        warnings.warn(
+                            f"head_dim ({self._cpp_config.head_dim}) != hidden_size/num_attention_heads ({expected_head_dim}). "
+                            f"Using head_dim from config."
+                        )
+
+            # Ensure vocab_size is set (explicit handling)
+            if hasattr(self._python_config, "vocab_size"):
+                self._cpp_config.vocab_size = self._python_config.vocab_size
+
+            # Validate config after setting all values (especially important for jiuge models)
+            if not self._cpp_config.validate():
+                raise ValueError(
+                    "C++ LlamaConfig validation failed. Check config values."
                 )
+
+            # Log key config values for debugging (especially useful for jiuge models)
+            import logging
+
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"LlamaConfig ({self._python_config.model_type}) C++ LlamaConfig created: vocab_size={self._cpp_config.vocab_size}, "
+                f"hidden_size={self._cpp_config.hidden_size}, "
+                f"num_attention_heads={self._cpp_config.num_attention_heads}, "
+                f"num_key_value_heads={self._cpp_config.num_key_value_heads}, "
+                f"head_dim={self._cpp_config.head_dim}, "
+                f"kv_dim={self._cpp_config.kv_dim()}, "
+                f"attention_bias={self._cpp_config.attention_bias}, "
+                f"attention_output_bias={self._cpp_config.attention_output_bias}"
+            )
 
         return self._cpp_config
 
@@ -85,7 +147,13 @@ class LlamaConfig:
 class LlamaForCausalLM(GenerationMixin):
     """Llama model for causal language modeling"""
 
-    def __init__(self, config, device=None, dtype=None):
+    def __init__(
+        self,
+        config,
+        device=None,
+        dtype=None,
+        distributed_config=DistConfig(1),
+    ):
         """
         Create LlamaForCausalLM
 
@@ -96,33 +164,58 @@ class LlamaForCausalLM(GenerationMixin):
         """
         super().__init__()
 
+        # Convert config to LlamaConfig (handles both regular Llama and Jiuge models)
         if isinstance(config, dict):
             config = LlamaConfig(**config)
         elif not isinstance(config, LlamaConfig):
-            config = LlamaConfig(**config)
+            # Not a dict or LlamaConfig, try to convert
+            config = LlamaConfig(config)
+        # If already LlamaConfig, use as-is (it will auto-detect jiuge models)
 
         if device is None:
             device = infinicore.device()
 
         self.use_cache = False
 
+        # Store the Python wrapper config so it can be accessed later
+        # This is needed for DynamicCache which calls config.get_text_config()
+        self._config = config
+
         self._device = device
-        self._model = _infinilm_llama.LlamaForCausalLM(
-            config._underlying, device._underlying, dtype
+        # self._model = _infinilm.LlamaForCausalLM(
+        #     config._underlying, device._underlying, dtype
+        # )
+        self._model = _infinilm.InferEngine(
+            config._underlying, distributed_config._underlying, device._underlying.type
         )
 
-    def state_dict(self):
-        """Get model state dictionary with parameter shapes"""
-        return self._model.state_dict()
+    def reset_cache(self, batch_size: int, pos: int = 0, initial_capacity: int = 1024):
+        """Reset the cache for the model"""
+        infinicore.sync_device()
 
-    def load_state_dict(self, state_dict):
+        cache_config = self._model.get_cache_config()
+        cache_config.initial_batch_size = batch_size
+        cache_config.initial_capacity = initial_capacity
+
+        self._model.reset_cache(cache_config, pos)
+
+    def state_dict_keyname(self):
+        """Get model key name."""
+        return self._model.state_dict()[0].keys()
+
+    def load_state_dict(self, state_dict, strict=None):
         """
         Load state dictionary into the model
 
         Args:
             state_dict: Dictionary mapping parameter names to InfiniCore tensors, numpy arrays, or torch tensors
         """
-        self._model.load_state_dict(state_dict, self._device._underlying)
+        # self._model.load_state_dict(state_dict, self._device._underlying)
+        for name, param in state_dict.items():
+            self._model.load_param(name, param._underlying)
+
+    def load_param(self, name: str, weight: infinicore.Tensor):
+        self._model.load_param(name, weight._underlying)
 
     def get_parameter(self, name):
         """
@@ -139,12 +232,21 @@ class LlamaForCausalLM(GenerationMixin):
     @property
     def config(self):
         """Get model configuration"""
-        return self._model.config()
+        # Return the Python wrapper config instead of C++ config
+        # This ensures compatibility with code that expects PretrainedConfig methods
+        # like get_text_config() used by DynamicCache
+        return self._config
 
     def forward(self, input_ids, position_ids, *args, **kwargs):
         kv_caches = None
+        # return infinicore.Tensor(
+        #     self._model.forward(input_ids, position_ids, kv_caches)
+        # )
         return infinicore.Tensor(
-            self._model.forward(input_ids, position_ids, kv_caches)
+            self._model.generate(
+                input_ids._underlying,
+                position_ids._underlying,
+            )
         )
 
     def __call__(self, input_ids, position_ids, *args, **kwargs):
@@ -156,6 +258,7 @@ class LlamaForCausalLM(GenerationMixin):
         model_path: Union[str, os.PathLike],
         device: Optional[infinicore.device] = None,
         dtype: Optional[infinicore.dtype] = None,
+        **kwargs,
     ):
         """
         Load a pretrained LlamaForCausalLM model from a directory.
@@ -175,5 +278,6 @@ class LlamaForCausalLM(GenerationMixin):
         with open(config_path, "r") as f:
             config_dict = json.load(f)
 
+        # LlamaConfig automatically detects and handles jiuge models
         config = LlamaConfig(config_dict)
-        return cls(config, device=device, dtype=dtype)
+        return cls(config, device=device, dtype=dtype, **kwargs)

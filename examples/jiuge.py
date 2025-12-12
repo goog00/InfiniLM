@@ -1,8 +1,9 @@
 import infinicore
 from transformers import AutoTokenizer
 from tokenizers import decoders as _dec
-from infinilm.modeling_utils import get_model_state_dict
+from infinilm.modeling_utils import load_model_state_dict_by_file
 import infinilm
+from infinilm.distributed import DistConfig
 import argparse
 import sys
 import time
@@ -54,17 +55,17 @@ def get_args():
     parser.add_argument(
         "--backend",
         type=str,
-        default="python",
+        default="cpp",
         help="python or cpp model",
     )
     parser.add_argument(
         "--dtype",
         type=str,
-        default="float32",
+        default="bfloat16",
         help="float32, float16, bfloat16",
     )
     parser.add_argument(
-        "--batch_size",
+        "--batch-size",
         type=int,
         default=1,
         help="number of prompts in a batch",
@@ -74,6 +75,12 @@ def get_args():
         type=str,
         default="How are you",
         help="input prompt",
+    )
+    parser.add_argument(
+        "--tp",
+        type=int,
+        default=1,
+        help="total rank for tensor parallel",
     )
 
     return parser.parse_args()
@@ -86,6 +93,7 @@ def test(
     infini_dtype=infinicore.bfloat16,
     infini_device=infinicore.device("cpu", 0),
     backend="python",
+    tp=1,
 ):
     model_path = os.path.expanduser(model_path)
     # ---------------------------------------------------------------------------- #
@@ -96,18 +104,13 @@ def test(
         device=infini_device,
         dtype=infini_dtype,
         backend=backend,
+        distributed_config=DistConfig(tp),
     )
 
     # ---------------------------------------------------------------------------- #
     #                        加载权重
     # ---------------------------------------------------------------------------- #
-    model_param_infini = get_model_state_dict(
-        model_path,
-        device=infini_device,
-        dtype=infini_dtype,
-    )
-
-    model.load_state_dict(model_param_infini, strict=True)
+    load_model_state_dict_by_file(model, model_path, dtype=infini_dtype)
 
     # ---------------------------------------------------------------------------- #
     #                        创建 tokenizer
@@ -131,8 +134,6 @@ def test(
                     _dec.Fuse(),
                 ]
             )
-    else:
-        raise ValueError(f"Unsupported model type: {model.config.model_type}")
 
     # ---------------------------------------------------------------------------- #
     #                        token编码
@@ -190,8 +191,8 @@ if __name__ == "__main__":
         device_str = "cuda"
     else:
         print(
-            "Usage:  python examples/llama.py [--cpu | --nvidia | --metax | --moore | --iluvatar] --model_path=<path/to/model_dir>\n"
-            "such as, python examples/llama.py --nvidia --model_path=~/TinyLlama-1.1B-Chat-v1.0"
+            "Usage:  python examples/jiuge.py [--cpu | --nvidia | --metax | --moore | --iluvatar] --model_path=<path/to/model_dir>\n"
+            "such as, python examples/jiuge.py --nvidia --model_path=~/TinyLlama-1.1B-Chat-v1.0"
         )
         sys.exit(1)
     prompts = [args.prompt for _ in range(args.batch_size)]
@@ -199,6 +200,7 @@ if __name__ == "__main__":
     model_path = args.model_path
     max_new_tokens = args.max_new_tokens
     backend = args.backend
+    tp = args.tp
 
     infini_device = infinicore.device(device_str, 0)
     if args.dtype == "float32":
@@ -217,4 +219,5 @@ if __name__ == "__main__":
         infini_device=infini_device,
         infini_dtype=infini_dtype,
         backend=backend,
+        tp=tp,
     )

@@ -47,18 +47,14 @@ class GenerationMixin:
         self,
         bs: int,
         seq_length: int,
-        device: infinicore.device,
     ) -> infinicore.Tensor:
         """Calculates `position_ids` for the pre-fill stage"""
         position_ids_list = [list(range(0, seq_length)) for i in range(bs)]
 
-        return infinicore.from_list(
-            position_ids_list, dtype=infinicore.int64, device=device
-        )
+        return infinicore.from_list(position_ids_list, dtype=infinicore.int64)
 
     def prepare_inputs_for_generation(
         self,
-        device: infinicore.device,
         past_key_values: Optional[Cache] = None,
         **kwargs,
     ):
@@ -79,9 +75,7 @@ class GenerationMixin:
         if current_position_ids is None:
             # prill阶段
             bs, seq_len = kwargs["input_ids"].shape[0:2]
-            model_inputs["position_ids"] = self._get_initial_position_ids(
-                bs, seq_len, device
-            )
+            model_inputs["position_ids"] = self._get_initial_position_ids(bs, seq_len)
 
         else:
             # decoder 阶段
@@ -100,9 +94,11 @@ class GenerationMixin:
         # -------------------------------------------------------------------- #
         #                 所需的: token的input_ids
         # -------------------------------------------------------------------- #
-        if kwargs.get("next_token_id", None) is not None:
-            next_token_id = kwargs["next_token_id"]
-            model_inputs["input_ids"] = infinicore.from_list([[next_token_id]])
+        if kwargs.get("next_token_ids", None) is not None:
+            next_token_ids = kwargs["next_token_ids"]
+            model_inputs["input_ids"] = infinicore.from_list(
+                [[id_] for id_ in next_token_ids],
+            )
 
         # -------------------------------------------------------------------- #
         #                 其他
@@ -117,12 +113,25 @@ class GenerationMixin:
         self,
         input_ids: infinicore.Tensor,
         max_new_tokens: int,
-        device: infinicore.device,
         tokenizer,
-        config,
+        stop_on_eos=True,
         **kwargs,
     ):
         model_kwargs = kwargs
+
+        # -------------------------------------------------------------------- #
+        # CRITICAL: Reset internal cache before each new generation
+        # This prevents state from persisting between different questions/prompts
+        # -------------------------------------------------------------------- #
+        # Check if this is a cpp backend model (has _model attribute with reset_cache method)
+        if hasattr(self, "_model") and hasattr(self._model, "reset_cache"):
+            try:
+                self._model.reset_cache()
+            except Exception as e:
+                # If reset_cache fails, log but continue (shouldn't happen)
+                import warnings
+
+                warnings.warn(f"Failed to reset cache: {e}")
 
         # -------------------------------------------------------------------- #
         #                       创建 cache                                      #
@@ -140,9 +149,8 @@ class GenerationMixin:
         result = self._sample(
             input_ids,
             max_new_tokens=max_new_tokens,
-            device=device,
             tokenizer=tokenizer,
-            config=config,
+            stop_on_eos=stop_on_eos,
             **model_kwargs,
         )
         return result
@@ -151,9 +159,8 @@ class GenerationMixin:
         self,
         input_ids: infinicore.Tensor,
         max_new_tokens: int,
-        device: infinicore.device,
         tokenizer,
-        config,
+        stop_on_eos=True,
         **model_kwargs,
     ):
         r"""
@@ -162,16 +169,21 @@ class GenerationMixin:
         Parameters:
             input_ids (batch_size, seq_len): The sequence used as a prompt for the generation.
             max_new_tokens: Maximum number of new tokens.
-            device: infinicore.device.
             tokenizer: translating data into raw text.
         """
 
         batch_size, seq_len = input_ids.shape[:2]
 
-        eos_token_id = config.eos_token_id
+        eos_token_id = self.config.eos_token_id
         eos_token_id_list = (
             [eos_token_id] if isinstance(eos_token_id, int) else eos_token_id
         )
+
+        # Extract sampling parameters from kwargs with defaults
+        random_val = model_kwargs.get("random_val", 0.1)
+        topp = model_kwargs.get("topp", 0.8)
+        topk = model_kwargs.get("topk", 1)
+        temperature = model_kwargs.get("temperature", 1.0)
 
         # -------------------------------------------------------------------------- #
         #                     初始化 position_ids
@@ -188,15 +200,16 @@ class GenerationMixin:
             # -------------------------------------------------------------------------- #
             #                     prepare model inputs
             # -------------------------------------------------------------------------- #
-            model_inputs = self.prepare_inputs_for_generation(device, **model_kwargs)
+            start_time = time.time()
+            model_inputs = self.prepare_inputs_for_generation(**model_kwargs)
 
             model_kwargs["position_ids"] = model_inputs["position_ids"]
 
             # -------------------------------------------------------------------------- #
             #                     计算一次
             # -------------------------------------------------------------------------- #
-            start_time = time.time()
             logits = self(**model_inputs)
+            infinicore.sync_device()
 
             # -------------------------------------------------------------------------- #
             #                     处理输出
@@ -213,43 +226,47 @@ class GenerationMixin:
                 dtype=infinicore.int32,
                 device=token_scores.device,
             )
+
             for i in range(0, batch_size):
-                score = token_scores.narrow(0, i, 1).view([vocab_size])
+                score = token_scores.narrow(0, i, 1).view((vocab_size,))
                 out = next_tokens.narrow(0, i, 1).view([])
                 infinicore.nn.functional.random_sample(
                     score,
-                    0.8,
-                    0.1,
-                    1,
-                    1.0,
+                    random_val,
+                    topp,
+                    topk,
+                    temperature,
                     out=out,
                 )
 
             infinicore.sync_stream()  # 计算结束前需要同步
-
-            end_time = time.time()
-            time_list.append((end_time - start_time) * 1000)
-
             # ----------------------------------------------------------------- #
             #                得到下一个token的id，并解码为字符
             # ----------------------------------------------------------------- #
             token_id = next_tokens.to_numpy()[0]
             output_str = tokenizer.decode([token_id], skip_special_tokens=True)
 
-            model_kwargs["next_token_id"] = token_id
+            model_kwargs["next_token_ids"] = next_tokens.to_numpy().tolist()
             output_tokens_list.append(token_id)
             output_content += output_str
 
-            print(output_str, end="", flush=True)
-            if token_id in eos_token_id_list:
-                break
+            end_time = time.time()
+            time_list.append((end_time - start_time) * 1000)
 
+            print(output_str, end="", flush=True)
+            if stop_on_eos and token_id in eos_token_id_list:
+                break
         print("\n</s>")
+        print(f"\n\n\n Generation completed in {round(sum(time_list), 2)} ms")
         print(
-            f"\n\n\n Time per step:  prefill {round(time_list[0], 2)} ms/token\n",
+            f" Batchsize={batch_size}  Per_Batch_Input_Len={seq_len}  Per_Batch_New_Tokens={len(time_list)}\n"
         )
         print(
-            f" Time per step:  decoder {round(sum(time_list[1:]) / (len(time_list) - 1), 2)} ms/token \n",
+            f" Prefill TTFT: {round(time_list[0], 2)}ms  Throughput: {round((1000 * batch_size * seq_len) / time_list[0], 2)}tok/s\n",
         )
+        if len(time_list) > 1:
+            print(
+                f" Decode  Avg ITL: {round(sum(time_list[1:]) / (len(time_list) - 1), 2)}ms   Throughput: {round((1000 * batch_size * (len(time_list) - 1)) / sum(time_list[1:]), 2)}tok/s\n",
+            )
 
         return output_tokens_list, output_content
