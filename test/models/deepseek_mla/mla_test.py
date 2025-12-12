@@ -4,6 +4,13 @@ import time
 import torch
 import torch.nn.functional as F
 
+# When invoked as `python test/.../mla_test.py` (not `-m`),
+# Python won't treat `test` as an importable top-level package.
+# Ensure repo root is on sys.path for consistent imports.
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../"))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 # Keep consistent with existing attention tests
 WARMUPS = 10
 RUNS = 100
@@ -342,7 +349,13 @@ def main():
     torch.manual_seed(args.seed)
 
     # Import your reference MLA from existing mla_test1.py to keep consistent with in-repo prototype
-    from test.models.deepseek_mla.mla_test1 import DeepSeekV3Config, DeepSeekV3MLA
+    try:
+        from test.models.deepseek_mla.mla_test1 import DeepSeekV3Config, DeepSeekV3MLA
+    except ModuleNotFoundError as e:
+        raise SystemExit(
+            f"Failed to import reference MLA from test.models.deepseek_mla.mla_test1: {e}. "
+            "Run from repo root or use `python -m test.models.deepseek_mla.mla_test ...`."
+        )
 
     cfg = DeepSeekV3Config(args.model_path)
     cfg.device = device
