@@ -255,8 +255,9 @@ class MLA(nn.Module):
         scores = (scores_nope + scores_pe) * self.softmax_scale
         
         # Apply mask if provided
+        # mask shape: [seq, total_len], scores shape: [batch, n_heads, seq, total_len]
         if mask is not None:
-            scores = scores + mask.unsqueeze(1)
+            scores = scores + mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, total_len]
         
         # Softmax
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
@@ -380,8 +381,9 @@ class MLAWithNaiveCache(nn.Module):
         k_t = self.k_cache[:bsz, :end_pos].permute(0, 2, 3, 1)  # [batch, n_heads, qk_head_dim, total_len]
         scores = torch.matmul(q_t, k_t) * self.softmax_scale  # [batch, n_heads, seq, total_len]
         
+        # mask shape: [seq, total_len], scores shape: [batch, n_heads, seq, total_len]
         if mask is not None:
-            scores = scores + mask.unsqueeze(1)
+            scores = scores + mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, total_len]
         
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
         
