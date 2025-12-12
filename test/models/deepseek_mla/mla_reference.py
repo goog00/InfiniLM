@@ -7,6 +7,8 @@ kv_cache + pe_cache caching strategy.
 
 Reference: https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py
 """
+import os
+import sys
 import math
 import torch
 import torch.nn as nn
@@ -14,7 +16,10 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-from .utils import MLAConfig, apply_rotary_emb, precompute_freqs_cis
+# Add the current directory to path for local imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from utils import MLAConfig, apply_rotary_emb, precompute_freqs_cis
 
 
 class RMSNorm(nn.Module):
