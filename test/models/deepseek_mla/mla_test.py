@@ -15,10 +15,19 @@ Usage:
 import os
 import sys
 import time
+import json
 import argparse
 import torch
 import torch.nn as nn
 from typing import List, Dict, Any, Tuple, Optional
+
+try:
+    import safetensors
+    from safetensors import safe_open
+    HAS_SAFETENSORS = True
+except ImportError:
+    HAS_SAFETENSORS = False
+    print("Warning: safetensors not installed. Real weight loading will be unavailable.")
 
 # Add the current directory to path for local imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -143,6 +152,132 @@ def get_mla_config(use_small: bool = False) -> MLAConfig:
         )
 
 
+def load_config_from_model_path(model_path: str) -> MLAConfig:
+    """
+    Load MLA configuration from model's config.json file.
+    
+    Args:
+        model_path: Path to the model directory containing config.json
+    
+    Returns:
+        MLAConfig instance with parameters loaded from config.json
+    """
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    with open(config_path, 'r') as f:
+        cfg = json.load(f)
+    
+    # Map DeepSeek config keys to MLAConfig parameters
+    return MLAConfig(
+        dim=cfg.get("hidden_size", 7168),
+        n_heads=cfg.get("num_attention_heads", 128),
+        q_lora_rank=cfg.get("q_lora_rank", 1536),
+        kv_lora_rank=cfg.get("kv_lora_rank", 512),
+        qk_nope_head_dim=cfg.get("qk_nope_head_dim", 128),
+        qk_rope_head_dim=cfg.get("qk_rope_head_dim", 64),
+        v_head_dim=cfg.get("v_head_dim", 128),
+        max_seq_len=cfg.get("max_position_embeddings", 4096 * 4),
+        original_seq_len=cfg.get("original_max_position_embeddings", 4096),
+        rope_theta=cfg.get("rope_theta", 10000.0),
+        rope_factor=cfg.get("rope_scaling", {}).get("factor", 40.0) if cfg.get("rope_scaling") else 40.0,
+        beta_fast=cfg.get("rope_scaling", {}).get("beta_fast", 32) if cfg.get("rope_scaling") else 32,
+        beta_slow=cfg.get("rope_scaling", {}).get("beta_slow", 1) if cfg.get("rope_scaling") else 1,
+        mscale=cfg.get("rope_scaling", {}).get("mscale", 1.0) if cfg.get("rope_scaling") else 1.0,
+    )
+
+
+def load_weights_from_safetensors(
+    model: nn.Module,
+    model_path: str,
+    layer_idx: int = 0,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+) -> None:
+    """
+    Load real model weights from safetensors files into the MLA model.
+    
+    This function loads weights from DeepSeek model's safetensors files.
+    It supports both BF16 (original) and quantized (AWQ) weight formats.
+    
+    Args:
+        model: MLA model instance (MLA or MLAWithNaiveCache)
+        model_path: Path to the model directory containing safetensors files
+        layer_idx: Which layer's weights to load (default: 0)
+        device: Target device
+        dtype: Target data type
+    """
+    if not HAS_SAFETENSORS:
+        raise RuntimeError("safetensors is required for loading real weights. Install with: pip install safetensors")
+    
+    # Find all safetensors files
+    safetensor_files = sorted([
+        f for f in os.listdir(model_path) 
+        if f.endswith(".safetensors")
+    ])
+    
+    if not safetensor_files:
+        raise FileNotFoundError(f"No safetensors files found in {model_path}")
+    
+    print(f"Loading weights from layer {layer_idx} in {model_path}")
+    
+    # Weight name mapping (model state_dict key -> safetensors key pattern)
+    # DeepSeek-R1/V3 uses these naming conventions:
+    weight_mapping = {
+        # Query projection (LoRA)
+        "wq_a.weight": f"model.layers.{layer_idx}.self_attn.q_a_proj.weight",
+        "q_norm.weight": f"model.layers.{layer_idx}.self_attn.q_a_layernorm.weight",
+        "wq_b.weight": f"model.layers.{layer_idx}.self_attn.q_b_proj.weight",
+        # KV projection (LoRA)
+        "wkv_a.weight": f"model.layers.{layer_idx}.self_attn.kv_a_proj_with_mqa.weight",
+        "kv_norm.weight": f"model.layers.{layer_idx}.self_attn.kv_a_layernorm.weight",
+        "wkv_b.weight": f"model.layers.{layer_idx}.self_attn.kv_b_proj.weight",
+        # Output projection
+        "wo.weight": f"model.layers.{layer_idx}.self_attn.o_proj.weight",
+    }
+    
+    # Collect all tensors from safetensors files
+    all_tensors = {}
+    for fname in safetensor_files:
+        fpath = os.path.join(model_path, fname)
+        with safe_open(fpath, framework="pt") as f:
+            for key in f.keys():
+                # Only load attention weights for the specified layer
+                if f"layers.{layer_idx}.self_attn" in key:
+                    all_tensors[key] = f.get_tensor(key)
+    
+    if not all_tensors:
+        print(f"Warning: No weights found for layer {layer_idx}. Using random initialization.")
+        return
+    
+    # Load weights into model
+    loaded_count = 0
+    state_dict = model.state_dict()
+    
+    for model_key, safetensor_key in weight_mapping.items():
+        if safetensor_key in all_tensors:
+            tensor = all_tensors[safetensor_key].to(device=device, dtype=dtype)
+            
+            # Handle shape mismatches (e.g., some models store transposed weights)
+            if model_key in state_dict:
+                expected_shape = state_dict[model_key].shape
+                if tensor.shape != expected_shape:
+                    if tensor.T.shape == expected_shape:
+                        tensor = tensor.T
+                    else:
+                        print(f"Warning: Shape mismatch for {model_key}: "
+                              f"expected {expected_shape}, got {tensor.shape}")
+                        continue
+                
+                state_dict[model_key] = tensor
+                loaded_count += 1
+                print(f"  Loaded: {model_key} <- {safetensor_key} {tensor.shape}")
+    
+    model.load_state_dict(state_dict)
+    print(f"Successfully loaded {loaded_count}/{len(weight_mapping)} weights")
+
+
 # ============================================================================
 # Correctness Test
 # ============================================================================
@@ -150,6 +285,7 @@ def test_correctness(
     config: MLAConfig,
     device: str,
     dtype: torch.dtype = torch.bfloat16,
+    model_path: Optional[str] = None,
 ) -> bool:
     """
     Test correctness by comparing absorb mode with naive mode.
@@ -171,6 +307,11 @@ def test_correctness(
     # Create both models
     model_absorb = create_mla_from_config(config, device, dtype, use_absorb=True)
     model_naive = create_mla_from_config(config, device, dtype, use_absorb=False)
+    
+    # Load real weights if model_path is provided
+    if model_path is not None:
+        print(f"\nLoading real weights from: {model_path}")
+        load_weights_from_safetensors(model_absorb, model_path, layer_idx=0, device=device, dtype=dtype)
     
     # Copy weights from absorb to naive to ensure identical weights
     copy_weights(model_absorb, model_naive)
@@ -592,6 +733,7 @@ def run_performance_tests(
     device: str,
     dtype: torch.dtype,
     use_absorb: bool = True,
+    model_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run performance benchmarks.
@@ -601,6 +743,7 @@ def run_performance_tests(
         device: Target device
         dtype: Data type
         use_absorb: Use absorb mode (True) or naive mode (False)
+        model_path: Path to load real weights from (optional)
     
     Returns:
         Dictionary of benchmark results
@@ -612,6 +755,12 @@ def run_performance_tests(
     
     # Create model
     model = create_mla_from_config(config, device, dtype, use_absorb=use_absorb)
+    
+    # Load real weights if model_path is provided
+    if model_path is not None:
+        print(f"Loading real weights from: {model_path}")
+        load_weights_from_safetensors(model, model_path, layer_idx=0, device=device, dtype=dtype)
+    
     model.eval()
     
     # Precompute freqs_cis
@@ -665,13 +814,32 @@ def main():
     
     device = get_device(args)
     dtype = torch.bfloat16
-    config = get_mla_config(use_small=args.use_small_config)
+    
+    # Load config from model_path if provided, otherwise use default/small config
+    if args.model_path and os.path.exists(args.model_path):
+        print(f"\nLoading configuration from: {args.model_path}")
+        try:
+            config = load_config_from_model_path(args.model_path)
+            print("Successfully loaded config from model path.")
+        except Exception as e:
+            print(f"Warning: Failed to load config from model path: {e}")
+            print("Falling back to default config.")
+            config = get_mla_config(use_small=args.use_small_config)
+    else:
+        config = get_mla_config(use_small=args.use_small_config)
+        if args.model_path:
+            print(f"Warning: Model path not found: {args.model_path}")
+            print("Using default configuration with random weights.")
     
     print("\n" + "*" * 80)
     print("DeepSeek MLA (Multi-head Latent Attention) Test")
     print("*" * 80)
     print(f"\nDevice: {device}")
     print(f"Data Type: {dtype}")
+    if args.model_path and os.path.exists(args.model_path):
+        print(f"Model Path: {args.model_path}")
+    else:
+        print("Weights: Random initialization")
     print(f"\nMLA Configuration:")
     print(f"  dim: {config.dim}")
     print(f"  n_heads: {config.n_heads}")
@@ -682,21 +850,24 @@ def main():
     print(f"  v_head_dim: {config.v_head_dim}")
     print(f"  qk_head_dim (total): {config.qk_head_dim}")
     
+    # Determine model_path for weight loading (None if not provided or not found)
+    model_path = args.model_path if (args.model_path and os.path.exists(args.model_path)) else None
+    
     # ----- Correctness Test -----
     if not args.skip_correctness:
-        correctness_passed = test_correctness(config, device, dtype)
+        correctness_passed = test_correctness(config, device, dtype, model_path=model_path)
         if not correctness_passed:
             print("\n⚠️  Correctness tests failed! Performance results may not be meaningful.")
     
     # ----- Performance Tests -----
     if not args.skip_performance:
         # Test Absorb mode (required implementation)
-        results_absorb = run_performance_tests(config, device, dtype, use_absorb=True)
+        results_absorb = run_performance_tests(config, device, dtype, use_absorb=True, model_path=model_path)
         
         # Optionally test Naive mode for comparison
         print("\n" + "-" * 80)
         print("Comparing with Naive mode (for reference)...")
-        results_naive = run_performance_tests(config, device, dtype, use_absorb=False)
+        results_naive = run_performance_tests(config, device, dtype, use_absorb=False, model_path=model_path)
         
         # Summary
         print("\n" + "=" * 80)

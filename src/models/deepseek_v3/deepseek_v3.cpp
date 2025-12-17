@@ -144,10 +144,6 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
     auto attn_score_buf = Tensor::buffer(dt_logits, {nh, max_qk_size}, rsrc.memory_pool);
     auto attn_val_buf = Tensor::buffer(dt_logits, {nh, max_seq_len, d_v}, rsrc.memory_pool);
 
-    // ============== MODE SELECTION ==============
-    // Set to true to use Absorb mode (optimized), false to use original mode
-    const bool use_absorb_mode = true;
-    
     // Check if all requests are decode (seq_len=1) for decode-specific optimization
     bool is_all_decode = true;
     for (uint32_t req = 0; req < nreq; req++) {
@@ -157,27 +153,19 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
         }
     }
 
-    // ============== MEMORY OPTIMIZATION ==============
-    // Reuse buffers where possible, allocate only what's needed
-    std::shared_ptr<Tensor> wkv_b_dequant, q_absorbed_buf, weighted_kv_buf;
-    // Reuse attn_score_buf for both nope and pe scores (compute sequentially, fuse with add)
-    if (use_absorb_mode) {
-        // wkv_b dequantized weight: [r_kv, nh * (d_nope + d_v)]
-        wkv_b_dequant = Tensor::buffer(dt_logits, {r_kv, nh * (d_nope + d_v)}, rsrc.memory_pool);
-        
-        if (is_all_decode) {
-            // DECODE OPTIMIZATION: Smaller buffers for seq_len=1
-            // q_absorbed buffer: [1, nh, r_kv] - only need 1 position
-            q_absorbed_buf = Tensor::buffer(dt_logits, {1, nh, r_kv}, rsrc.memory_pool);
-            // Weighted cache output: [1, nh, r_kv]
-            weighted_kv_buf = Tensor::buffer(dt_logits, {1, nh, r_kv}, rsrc.memory_pool);
-        } else {
-            // Prefill: need full buffers
-            q_absorbed_buf = Tensor::buffer(dt_logits, {max_seq_len, nh, r_kv}, rsrc.memory_pool);
-            weighted_kv_buf = Tensor::buffer(dt_logits, {max_seq_len, nh, r_kv}, rsrc.memory_pool);
-        }
-        // Note: Removed attn_score_nope_buf and attn_score_pe_buf
-        // We now compute scores directly into attn_score_buf using fused add
+    // ============== ABSORB MODE BUFFERS ==============
+    // wkv_b dequantized weight: [r_kv, nh * (d_nope + d_v)]
+    auto wkv_b_dequant = Tensor::buffer(dt_logits, {r_kv, nh * (d_nope + d_v)}, rsrc.memory_pool);
+    
+    std::shared_ptr<Tensor> q_absorbed_buf, weighted_kv_buf;
+    if (is_all_decode) {
+        // DECODE OPTIMIZATION: Smaller buffers for seq_len=1
+        q_absorbed_buf = Tensor::buffer(dt_logits, {1, nh, r_kv}, rsrc.memory_pool);
+        weighted_kv_buf = Tensor::buffer(dt_logits, {1, nh, r_kv}, rsrc.memory_pool);
+    } else {
+        // Prefill: need full buffers
+        q_absorbed_buf = Tensor::buffer(dt_logits, {max_seq_len, nh, r_kv}, rsrc.memory_pool);
+        weighted_kv_buf = Tensor::buffer(dt_logits, {max_seq_len, nh, r_kv}, rsrc.memory_pool);
     }
 
     // Scale factor for attention
@@ -213,13 +201,11 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
         auto k_rot = kv_a_buf->slice(1, r_kv, d_rope)->view({ntok, 1, d_rope});
         rope_v2(k_rot, k_rot, pos_ids_buf, weights->sin_table, weights->cos_table);
 
-        // Dequantize wkv_b once per layer (used in both modes, but differently)
-        if (use_absorb_mode) {
-            getInferenceContext().dequant(wkv_b_dequant,
-                                          weights->w_layers[layer].mla->kv_b_proj->w,
-                                          weights->w_layers[layer].mla->kv_b_proj->s,
-                                          weights->w_layers[layer].mla->kv_b_proj->z);
-        }
+        // Dequantize wkv_b once per layer
+        getInferenceContext().dequant(wkv_b_dequant,
+                                      weights->w_layers[layer].mla->kv_b_proj->w,
+                                      weights->w_layers[layer].mla->kv_b_proj->s,
+                                      weights->w_layers[layer].mla->kv_b_proj->z);
 
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
@@ -232,22 +218,21 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
             auto kv_pass_req = kv_a_req->slice(1, 0, r_kv);
             auto k_rot_req = kv_a_req->slice(1, r_kv, d_rope);
 
-            // Update cache with new tokens (same for both modes)
+            // Update cache with new tokens
             rearrange(caches[req]->kv_pass[idev][layer]->slice(0, past_len, seq_len), kv_pass_req);
             rearrange(caches[req]->k_rot[idev][layer]->slice(0, past_len, seq_len), k_rot_req);
 
-            if (use_absorb_mode) {
-                // ============== ABSORB MODE ATTENTION ==============
-                // Key insight: Instead of decompressing the entire cache every time,
-                // we absorb wkv_b into Q and compute attention on compressed cache.
-                //
-                // Original: scores = Q @ (kv_cache @ wkv_b).T
-                // Absorb:   scores = (Q @ wkv_b) @ kv_cache.T
-                //
-                // This changes O(seq * total * hidden) to O(seq * hidden) for wkv_b application
+            // ============== ABSORB MODE ATTENTION ==============
+            // Key insight: Instead of decompressing the entire cache every time,
+            // we absorb wkv_b into Q and compute attention on compressed cache.
+            //
+            // Original: scores = Q @ (kv_cache @ wkv_b).T
+            // Absorb:   scores = (Q @ wkv_b) @ kv_cache.T
+            //
+            // This changes O(seq * total * hidden) to O(seq * hidden) for wkv_b application
 
-                auto kv_cache_req = caches[req]->kv_pass[idev][layer]->slice(0, 0, total_len);  // [total_len, r_kv]
-                auto pe_cache_req = caches[req]->k_rot[idev][layer]->slice(0, 0, total_len);    // [total_len, d_rope]
+            auto kv_cache_req = caches[req]->kv_pass[idev][layer]->slice(0, 0, total_len);  // [total_len, r_kv]
+            auto pe_cache_req = caches[req]->k_rot[idev][layer]->slice(0, 0, total_len);    // [total_len, d_rope]
 
                 // Split q into nope and pe parts
                 auto q_req_view = q_req->view({seq_len, nh, d_qk});
@@ -340,50 +325,14 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                            kv_cache_req,                          // [total_len, r_kv]
                            1.f, 0.f, nullptr, nullptr);
 
-                    // Step 4: Apply wkv_b_v to get final attention output
-                    auto attn_val_req = attn_val_buf->slice(1, 0, seq_len)->view({nh, seq_len, d_v});
-                    linear(attn_val_req,
-                           weighted_kv_req->permute({1, 0, 2}),  // [nh, seq_len, r_kv]
-                           wkv_b_v->view({r_kv, nh, d_v})->permute({1, 0, 2}),  // [nh, r_kv, d_v]
-                           1.f, 0.f, nullptr, nullptr);
-
-                    // Rearrange: [nh, seq_len, d_v] -> [seq_len, nh, d_v]
-                    rearrange(o_req, attn_val_req->permute({1, 0, 2}));
-                }
-
-            } else {
-                // ============== ORIGINAL MODE (for comparison) ==============
-                // Decompress entire cache every time
-                auto kv_b_req = kv_b_buf->slice(0, 0, total_len);
-                dequant_linear(kv_b_req, caches[req]->kv_pass[idev][layer]->slice(0, 0, total_len),
-                               weights->w_layers[layer].mla->kv_b_proj->w,
-                               weights->w_layers[layer].mla->kv_b_proj->s,
-                               weights->w_layers[layer].mla->kv_b_proj->z,
-                               1.0, 0.0, nullptr, nullptr);
-                auto full_v_req = kv_b_req->slice(1, nh * d_nope, nh * d_v);
-                
-                // Build full K
-                auto full_k_req = full_k_buf->slice(0, 0, total_len);
-                auto full_k_pass_req = full_k_req->slice(1, 0, nh * d_nope);
-                auto full_k_rot_req = full_k_req->slice(1, nh * d_nope, nh * d_rope);
-                rearrange(full_k_pass_req, kv_b_req->slice(1, 0, nh * d_nope));
-                rearrange(full_k_rot_req->view({total_len, nh, d_rope}), 
-                          k_rot_req->view_as({total_len, nh, d_rope}, {ptrdiff_t(d_rope), 0, 1}));
-
-                // Self attention
-                auto attn_score_req = attn_score_buf->slice(1, 0, seq_len * total_len)->view({nh, seq_len, total_len});
-                linear(attn_score_req,
-                       q_req->view({seq_len, nh, d_qk})->permute({1, 0, 2}),
-                       full_k_req->view({total_len, nh, d_qk})->permute({1, 2, 0}),
-                       attn_scale, 0.f, nullptr, nullptr);
-                
-                causalSoftmax(attn_score_req, attn_score_req);
-                
+                // Step 4: Apply wkv_b_v to get final attention output
                 auto attn_val_req = attn_val_buf->slice(1, 0, seq_len)->view({nh, seq_len, d_v});
-                linear(attn_val_req, attn_score_req, 
-                       full_v_req->view({total_len, nh, d_v})->permute({1, 0, 2}), 
+                linear(attn_val_req,
+                       weighted_kv_req->permute({1, 0, 2}),  // [nh, seq_len, r_kv]
+                       wkv_b_v->view({r_kv, nh, d_v})->permute({1, 0, 2}),  // [nh, r_kv, d_v]
                        1.f, 0.f, nullptr, nullptr);
-                
+
+                // Rearrange: [nh, seq_len, d_v] -> [seq_len, nh, d_v]
                 rearrange(o_req, attn_val_req->permute({1, 0, 2}));
             }
 
