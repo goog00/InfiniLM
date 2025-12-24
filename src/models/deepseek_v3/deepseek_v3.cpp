@@ -4,6 +4,8 @@
 #include "../../utils.hpp"
 #include "../inference_context.hpp"
 #include "infinicore_infer.h"
+#include "moe_dispatch.hpp"
+#include <cuda_runtime.h>
 
 #include <random>
 #include <thread>
@@ -312,8 +314,9 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
 
                 auto gate_correction_bias = weights->w_layers[layer].route->b;
                 topkrouter(values_gpu, indices_gpu, router_logits, gate_correction_bias, routed_scaling_factor, topk);
-                RUN_INFINI(infinirtMemcpy((void *)values_cpu.data(), values_gpu->data(), values_cpu.size() * sizeof(float), INFINIRT_MEMCPY_D2H));
-                RUN_INFINI(infinirtMemcpy((void *)indices_cpu.data(), indices_gpu->data(), indices_cpu.size() * sizeof(int), INFINIRT_MEMCPY_D2H));
+
+                // Dispatch to backend expert handler (may be optimized in infiniop backend)
+                expertDispatch(values_gpu, indices_gpu, hidden_states, router_states_sum, routed_scaling_factor, topk);
             }
 
             // (3) MoE操作：  hidden_states经过一个8个路由专家

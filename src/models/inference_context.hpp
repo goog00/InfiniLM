@@ -3,6 +3,7 @@
 #include "../cache_manager/opcache_manager.hpp"
 
 #include <cassert>
+#include <cstdlib>
 
 struct InferenceContext {
     infiniopHandle_t op_handle;
@@ -44,6 +45,18 @@ struct InferenceContext {
                     std::shared_ptr<Tensor> correction_bias, // F32
                     float routed_scaling_factor,
                     size_t topk);
+
+    // Expert dispatch: given top-k indices and values produced by topkrouter,
+    // perform dispatch/gather, execute per-expert FFN, and accumulate results
+    // into router_states_sum. Default implementation may copy indices to host
+    // and perform a safe fallback. High-performance device-side implementation
+    // should be provided in the backend (infiniop) and override this.
+    void expertDispatch(std::shared_ptr<Tensor> values, // F32 ntok*topk
+                        std::shared_ptr<Tensor> indices, // I32 ntok*topk
+                        std::shared_ptr<Tensor> hidden_states, // input hidden (ntok, d)
+                        std::shared_ptr<Tensor> router_states_sum, // output (ntok, d)
+                        float routed_scaling_factor,
+                        size_t topk);
 
     void swiglu(std::shared_ptr<Tensor> out,
                 std::shared_ptr<Tensor> up,
@@ -145,7 +158,14 @@ inline void linear(std::shared_ptr<Tensor> c, std::shared_ptr<Tensor> a,
 inline void dequant_linear(std::shared_ptr<Tensor> out, std::shared_ptr<Tensor> x,
                            std::shared_ptr<Tensor> w_w, std::shared_ptr<Tensor> w_s, std::shared_ptr<Tensor> w_z,
                            float alpha, float beta, std::shared_ptr<Tensor> residual, std::shared_ptr<Tensor> bias) {
-    auto w = Tensor::buffer(x->dtype(), {x->shape()[1], out->shape()[1]}, getInferenceContext().memory_pool);
+    // Support forcing FP16 compute for dequantized weights via env var
+    // If INFINI_FORCE_FP16 is set (non-empty), allocate dequantized weight in FP16
+    infiniDtype_t compute_dtype = x->dtype();
+    const char *force_fp16 = std::getenv("INFINI_FORCE_FP16");
+    if (force_fp16 != nullptr && force_fp16[0] != '\0') {
+        compute_dtype = INFINI_DTYPE_F16;
+    }
+    auto w = Tensor::buffer(compute_dtype, {x->shape()[1], out->shape()[1]}, getInferenceContext().memory_pool);
     getInferenceContext().dequant(w, w_w, w_s, w_z);
     getInferenceContext().linear(out, x, w, alpha, beta, residual, bias);
 }
