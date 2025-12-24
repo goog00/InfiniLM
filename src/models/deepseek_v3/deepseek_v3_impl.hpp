@@ -32,6 +32,16 @@ struct MLPWeight {
     std::shared_ptr<QuantLinearWeight> gate, up, down;
 };
 
+struct ExpertWeight {
+    std::shared_ptr<QuantLinearWeight> gate, up, down;
+};
+
+struct MoEWeight {
+    std::shared_ptr<GateWeight> route;
+    std::shared_ptr<MLPWeight> shared_expert;
+    std::vector<std::shared_ptr<ExpertWeight>> experts;
+};
+
 struct LayerWeight {
     std::shared_ptr<Tensor> mla_norm;
     std::shared_ptr<MLAWeight> mla;
@@ -40,6 +50,8 @@ struct LayerWeight {
     std::shared_ptr<GateWeight> route;
     std::shared_ptr<MLPWeight> share_expert;
     std::vector<std::shared_ptr<MLPWeight>> experts;
+    // For MoE version
+    std::shared_ptr<MoEWeight> moe;
 };
 
 struct DeepSeekV3DeviceWeights {

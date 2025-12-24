@@ -4,9 +4,22 @@
 #include "../engine/distributed/communication_group.hpp"
 
 namespace infinilm::layers {
+
+class FP8Linear : public infinicore::nn::Linear {
+public:
+    FP8Linear(size_t in_features, size_t out_features, bool bias = false,
+              const infinicore::DataType &dtype = infinicore::DataType::F32,
+              const infinicore::Device &device = infinicore::Device());
+
+    infinicore::Tensor forward(const infinicore::Tensor &input) override;
+
+    // FP8 specific parameters
+    infinicore::nn::Parameter scale_weight;
+    std::string scale_fmt;  // e.g., "ue8m0"
+};
+
 class QKVParallelLinear : public infinicore::nn::ColumnParallelLinear {
 public:
-    explicit QKVParallelLinear(size_t hidden_size,
                                size_t q_dim, size_t k_dim, size_t v_dim,
                                size_t num_q_head, size_t num_k_head, size_t num_v_head,
                                bool q_bias, bool k_bias, bool v_bias,

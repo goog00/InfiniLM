@@ -96,6 +96,16 @@ inline std::vector<std::shared_ptr<MLPWeight>> getExperts(const DeepSeekV3Meta *
     return experts;
 }
 
+inline std::shared_ptr<MoEWeight> getMoE(const DeepSeekV3Meta *meta, int ndev) {
+    auto moe = std::make_shared<MoEWeight>();
+    moe->route = std::make_shared<GateWeight>();
+    moe->route->w = getTensor(meta, meta->d, meta->nexperts);
+    moe->route->b = getTensor(meta, meta->nexperts);
+    moe->shared_expert = getShareExpert(meta, ndev);
+    moe->experts = getExperts(meta, ndev);
+    return moe;
+}
+
 inline std::shared_ptr<Tensor> getSinTable(const DeepSeekV3Meta *meta) {
     auto half_dh = meta->d_rope / 2;
     auto unit = dsize(meta->dt_logits);
@@ -179,6 +189,7 @@ DeepSeekV3Weights::DeepSeekV3Weights(
                 device_weights[dev]->w_layers[layer].route = getRouteWeight(meta);
                 device_weights[dev]->w_layers[layer].share_expert = getShareExpert(meta, ndev);
                 device_weights[dev]->w_layers[layer].experts = getExperts(meta, ndev);
+                device_weights[dev]->w_layers[layer].moe = getMoE(meta, ndev);
             }
         }
     }
@@ -351,7 +362,7 @@ void load_mlp_gate_weight(DeepSeekV3Weights *weights, void *cpu_ptr, size_t laye
     for (int dev = 0; dev < int(weights->device_weights.size()); dev++) {
         auto weight = weights->device_weights[dev];
         RUN_INFINI(infinirtSetDevice(weight->device, weight->dev_id));
-        weight->w_layers[layer].route->w->load(cpu_ptr, weight->load_stream);
+        weight->w_layers[layer].moe->route->w->load(cpu_ptr, weight->load_stream);
     }
 }
 
@@ -360,7 +371,7 @@ void load_mlp_gate_bias(DeepSeekV3Weights *weights, void *cpu_ptr, size_t layer)
     for (int dev = 0; dev < int(weights->device_weights.size()); dev++) {
         auto weight = weights->device_weights[dev];
         RUN_INFINI(infinirtSetDevice(weight->device, weight->dev_id));
-        weight->w_layers[layer].route->b->load(cpu_ptr, weight->load_stream);
+        weight->w_layers[layer].moe->route->b->load(cpu_ptr, weight->load_stream);
     }
 }
 
@@ -373,15 +384,15 @@ void load_mlp_shared_experts(DeepSeekV3Weights *weights,
     for (int dev = 0; dev < int(weights->device_weights.size()); dev++) {
         auto weight = weights->device_weights[dev];
         RUN_INFINI(infinirtSetDevice(weight->device, weight->dev_id));
-        auto gate_w = weight->w_layers[layer_id].share_expert->gate->w;
-        auto gate_s = weight->w_layers[layer_id].share_expert->gate->s;
-        auto gate_z = weight->w_layers[layer_id].share_expert->gate->z;
-        auto up_w = weight->w_layers[layer_id].share_expert->up->w;
-        auto up_s = weight->w_layers[layer_id].share_expert->up->s;
-        auto up_z = weight->w_layers[layer_id].share_expert->up->z;
-        auto down_w = weight->w_layers[layer_id].share_expert->down->w;
-        auto down_s = weight->w_layers[layer_id].share_expert->down->s;
-        auto down_z = weight->w_layers[layer_id].share_expert->down->z;
+        auto gate_w = weight->w_layers[layer_id].moe->shared_expert->gate->w;
+        auto gate_s = weight->w_layers[layer_id].moe->shared_expert->gate->s;
+        auto gate_z = weight->w_layers[layer_id].moe->shared_expert->gate->z;
+        auto up_w = weight->w_layers[layer_id].moe->shared_expert->up->w;
+        auto up_s = weight->w_layers[layer_id].moe->shared_expert->up->s;
+        auto up_z = weight->w_layers[layer_id].moe->shared_expert->up->z;
+        auto down_w = weight->w_layers[layer_id].moe->shared_expert->down->w;
+        auto down_s = weight->w_layers[layer_id].moe->shared_expert->down->s;
+        auto down_z = weight->w_layers[layer_id].moe->shared_expert->down->z;
         load_dist_linear(gate_weight_ptr, gate_scale_ptr, gate_zero_ptr, gate_w, gate_s, gate_z, weights->device_weights.size(), dev, weight->load_stream);
         load_dist_linear(up_weight_ptr, up_scale_ptr, up_zero_ptr, up_w, up_s, up_z, weights->device_weights.size(), dev, weight->load_stream);
         load_dist_linear(down_weight_ptr, down_scale_ptr, down_zero_ptr, down_w, down_s, down_z, weights->device_weights.size(), dev, weight->load_stream);
@@ -398,15 +409,15 @@ void load_mlp_experts(DeepSeekV3Weights *weights,
     for (int dev = 0; dev < int(weights->device_weights.size()); dev++) {
         auto weight = weights->device_weights[dev];
         RUN_INFINI(infinirtSetDevice(weight->device, weight->dev_id));
-        auto gate_w = weight->w_layers[layer_id].experts[expert_id]->gate->w;
-        auto gate_s = weight->w_layers[layer_id].experts[expert_id]->gate->s;
-        auto gate_z = weight->w_layers[layer_id].experts[expert_id]->gate->z;
-        auto up_w = weight->w_layers[layer_id].experts[expert_id]->up->w;
-        auto up_s = weight->w_layers[layer_id].experts[expert_id]->up->s;
-        auto up_z = weight->w_layers[layer_id].experts[expert_id]->up->z;
-        auto down_w = weight->w_layers[layer_id].experts[expert_id]->down->w;
-        auto down_s = weight->w_layers[layer_id].experts[expert_id]->down->s;
-        auto down_z = weight->w_layers[layer_id].experts[expert_id]->down->z;
+        auto gate_w = weight->w_layers[layer_id].moe->experts[expert_id]->gate->w;
+        auto gate_s = weight->w_layers[layer_id].moe->experts[expert_id]->gate->s;
+        auto gate_z = weight->w_layers[layer_id].moe->experts[expert_id]->gate->z;
+        auto up_w = weight->w_layers[layer_id].moe->experts[expert_id]->up->w;
+        auto up_s = weight->w_layers[layer_id].moe->experts[expert_id]->up->s;
+        auto up_z = weight->w_layers[layer_id].moe->experts[expert_id]->up->z;
+        auto down_w = weight->w_layers[layer_id].moe->experts[expert_id]->down->w;
+        auto down_s = weight->w_layers[layer_id].moe->experts[expert_id]->down->s;
+        auto down_z = weight->w_layers[layer_id].moe->experts[expert_id]->down->z;
         load_dist_linear(gate_weight_ptr, gate_scale_ptr, gate_zero_ptr, gate_w, gate_s, gate_z, weights->device_weights.size(), dev, weight->load_stream);
         load_dist_linear(up_weight_ptr, up_scale_ptr, up_zero_ptr, up_w, up_s, up_z, weights->device_weights.size(), dev, weight->load_stream);
         load_dist_linear(down_weight_ptr, down_scale_ptr, down_zero_ptr, down_w, down_s, down_z, weights->device_weights.size(), dev, weight->load_stream);

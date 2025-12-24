@@ -3,6 +3,35 @@
 #include <spdlog/spdlog.h>
 
 namespace infinilm::layers {
+
+// ---------------------------------------------------------
+// FP8 Linear
+// ---------------------------------------------------------
+FP8Linear::FP8Linear(size_t in_features, size_t out_features, bool bias,
+                     const infinicore::DataType &dtype, const infinicore::Device &device)
+    : infinicore::nn::Linear(in_features, out_features, bias, dtype, device) {
+    // Initialize scale_weight for FP8
+    // Assuming scale is per output feature, similar to DeepSeek-V3
+    scale_weight = infinicore::nn::Parameter(
+        infinicore::Tensor::empty({out_features, in_features}, infinicore::DataType::F32, device),
+        0, 0, 1);  // No TP for now
+    scale_fmt = "ue8m0";  // Default scale format
+}
+
+infinicore::Tensor FP8Linear::forward(const infinicore::Tensor &input) {
+    // Implement FP8 linear forward
+    // This is a simplified version; in practice, need to integrate with infinicore's FP8 GEMM
+    if (weight_->dtype() == infinicore::DataType::F8_E4M3) {
+        // FP8 path: dequantize weight, quantize input, GEMM
+        // For now, assume infinicore handles it; placeholder
+        auto dequant_weight = weight_;  // TODO: dequantize using scale_weight
+        return infinicore::nn::Linear::forward(input);  // Fallback
+    } else {
+        // Standard path
+        return infinicore::nn::Linear::forward(input);
+    }
+}
+
 // ---------------------------------------------------------
 // QKV Parallel Linear
 // ---------------------------------------------------------

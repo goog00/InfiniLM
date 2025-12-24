@@ -289,28 +289,28 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                 // 输入: hidden_states
                 // 输出: shared_states
                 dequant_linear(moe_gate_buf, hidden_states,
-                               weights->w_layers[layer].share_expert->gate->w,
-                               weights->w_layers[layer].share_expert->gate->s,
-                               weights->w_layers[layer].share_expert->gate->z, 1.0, 0.0, nullptr, nullptr);
+                               weights->w_layers[layer].moe->shared_expert->gate->w,
+                               weights->w_layers[layer].moe->shared_expert->gate->s,
+                               weights->w_layers[layer].moe->shared_expert->gate->z, 1.0, 0.0, nullptr, nullptr);
                 dequant_linear(moe_up_buf, hidden_states,
-                               weights->w_layers[layer].share_expert->up->w,
-                               weights->w_layers[layer].share_expert->up->s,
-                               weights->w_layers[layer].share_expert->up->z, 1.0, 0.0, nullptr, nullptr);
+                               weights->w_layers[layer].moe->shared_expert->up->w,
+                               weights->w_layers[layer].moe->shared_expert->up->s,
+                               weights->w_layers[layer].moe->shared_expert->up->z, 1.0, 0.0, nullptr, nullptr);
                 swiglu(moe_gate_buf, moe_up_buf, moe_gate_buf);
                 dequant_linear(shared_states, moe_gate_buf,
-                               weights->w_layers[layer].share_expert->down->w,
-                               weights->w_layers[layer].share_expert->down->s,
-                               weights->w_layers[layer].share_expert->down->z, 1.0, 0.0, nullptr, nullptr); // only rank 0 adds residual
+                               weights->w_layers[layer].moe->shared_expert->down->w,
+                               weights->w_layers[layer].moe->shared_expert->down->s,
+                               weights->w_layers[layer].moe->shared_expert->down->z, 1.0, 0.0, nullptr, nullptr); // only rank 0 adds residual
             }
 
             // (2) topk操作： hidden_states 经过 topkrouter
             {
                 // 输入: hidden_states
                 // 输出: values_cpu，indices_cpu
-                auto gate_weight = weights->w_layers[layer].route->w;
+                auto gate_weight = weights->w_layers[layer].moe->route->w;
                 gemm(router_logits, hidden_states, gate_weight, 1.0, 0.0); // 非量化的版本
 
-                auto gate_correction_bias = weights->w_layers[layer].route->b;
+                auto gate_correction_bias = weights->w_layers[layer].moe->route->b;
                 topkrouter(values_gpu, indices_gpu, router_logits, gate_correction_bias, routed_scaling_factor, topk);
                 RUN_INFINI(infinirtMemcpy((void *)values_cpu.data(), values_gpu->data(), values_cpu.size() * sizeof(float), INFINIRT_MEMCPY_D2H));
                 RUN_INFINI(infinirtMemcpy((void *)indices_cpu.data(), indices_gpu->data(), indices_cpu.size() * sizeof(int), INFINIRT_MEMCPY_D2H));
@@ -334,20 +334,20 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                     float alpha = values_cpu[itok * topk];
 
                     dequant_linear(moe_gate_buf_i, hidden_states_i,
-                                   weights->w_layers[layer].experts[index]->gate->w,
-                                   weights->w_layers[layer].experts[index]->gate->s,
-                                   weights->w_layers[layer].experts[index]->gate->z, 1.0, 0.0, nullptr, nullptr);
+                                   weights->w_layers[layer].moe->experts[index]->gate->w,
+                                   weights->w_layers[layer].moe->experts[index]->gate->s,
+                                   weights->w_layers[layer].moe->experts[index]->gate->z, 1.0, 0.0, nullptr, nullptr);
                     dequant_linear(moe_up_buf_i, hidden_states_i,
-                                   weights->w_layers[layer].experts[index]->up->w,
-                                   weights->w_layers[layer].experts[index]->up->s,
-                                   weights->w_layers[layer].experts[index]->up->z, 1.0, 0.0, nullptr, nullptr);
+                                   weights->w_layers[layer].moe->experts[index]->up->w,
+                                   weights->w_layers[layer].moe->experts[index]->up->s,
+                                   weights->w_layers[layer].moe->experts[index]->up->z, 1.0, 0.0, nullptr, nullptr);
 
                     swiglu(moe_gate_buf_i, moe_up_buf_i, moe_gate_buf_i);
 
                     dequant_linear(router_states_sum_i, moe_gate_buf_i,
-                                   weights->w_layers[layer].experts[index]->down->w,
-                                   weights->w_layers[layer].experts[index]->down->s,
-                                   weights->w_layers[layer].experts[index]->down->z, alpha, 0.0, nullptr, nullptr); // only rank 0 adds residual
+                                   weights->w_layers[layer].moe->experts[index]->down->w,
+                                   weights->w_layers[layer].moe->experts[index]->down->s,
+                                   weights->w_layers[layer].moe->experts[index]->down->z, alpha, 0.0, nullptr, nullptr); // only rank 0 adds residual
                 }
 
                 // 经过后续的专家 : C  = alpha * AB + C_last
@@ -356,20 +356,20 @@ void inferDeviceBatch(const DeepSeekV3Meta &meta, DeepSeekV3DeviceResource &rsrc
                     float alpha = values_cpu[itok * topk + k];
 
                     dequant_linear(moe_gate_buf_i, hidden_states_i,
-                                   weights->w_layers[layer].experts[index]->gate->w,
-                                   weights->w_layers[layer].experts[index]->gate->s,
-                                   weights->w_layers[layer].experts[index]->gate->z, 1.0, 0.0, nullptr, nullptr);
+                                   weights->w_layers[layer].moe->experts[index]->gate->w,
+                                   weights->w_layers[layer].moe->experts[index]->gate->s,
+                                   weights->w_layers[layer].moe->experts[index]->gate->z, 1.0, 0.0, nullptr, nullptr);
                     dequant_linear(moe_up_buf_i, hidden_states_i,
-                                   weights->w_layers[layer].experts[index]->up->w,
-                                   weights->w_layers[layer].experts[index]->up->s,
-                                   weights->w_layers[layer].experts[index]->up->z, 1.0, 0.0, nullptr, nullptr);
+                                   weights->w_layers[layer].moe->experts[index]->up->w,
+                                   weights->w_layers[layer].moe->experts[index]->up->s,
+                                   weights->w_layers[layer].moe->experts[index]->up->z, 1.0, 0.0, nullptr, nullptr);
 
                     swiglu(moe_gate_buf_i, moe_up_buf_i, moe_gate_buf_i);
 
                     dequant_linear(router_states_sum_i, moe_gate_buf_i,
-                                   weights->w_layers[layer].experts[index]->down->w,
-                                   weights->w_layers[layer].experts[index]->down->s,
-                                   weights->w_layers[layer].experts[index]->down->z, alpha, 0.0, router_states_sum_i, nullptr); // only rank 0 adds residual
+                                   weights->w_layers[layer].moe->experts[index]->down->w,
+                                   weights->w_layers[layer].moe->experts[index]->down->s,
+                                   weights->w_layers[layer].moe->experts[index]->down->z, alpha, 0.0, router_states_sum_i, nullptr); // only rank 0 adds residual
                 }
             }
 
