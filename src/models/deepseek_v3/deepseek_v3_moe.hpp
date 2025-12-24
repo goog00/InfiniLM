@@ -2,7 +2,7 @@
 #define DEEPSEEK_V3_MOE_H
 
 #include "deepseek_v3_impl.hpp"
-#include "../../layers/fused_linear.hpp"
+#include "../../../csrc/layers/fused_linear.hpp"
 #include "../../tensor.hpp"
 #include <memory>
 #include <vector>
