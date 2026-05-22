@@ -567,9 +567,93 @@ def _remap_baichuan(state_dict, config=None):
     return state_dict
 
 
+def _remap_ernie4_5_vl(state_dict, config=None):
+    """Remap ERNIE-4.5-VL model weights to InfiniLM format.
+    Handle MoE gate weight transpose, dtype conversion, and parameter name mapping issues."""
+    import torch
+    
+    result = {}
+    for key, tensor in state_dict.items():
+        new_key = key  # 默认保持键不变
+        
+        # Handle MoE gate weight transpose issue
+        if ".mlp.gate.weight" in key:
+            # Transpose the gate weight if shapes don't match expectations
+            expected_shape = tensor.shape
+            # Some checkpoints store weights in transposed format
+            if expected_shape[0] > expected_shape[1]:  # e.g., [2560, 64] instead of [64, 2560]
+                tensor = tensor.t()  # Transpose to correct shape
+            
+            # Ensure consistent dtype (convert to bfloat16 as expected by the model)
+            if tensor.dtype != torch.bfloat16:
+                tensor = tensor.to(torch.bfloat16)
+        
+        # Handle vision encoder specific parameter name mappings
+        # Based on the error message, it seems some parameters are named differently
+        elif key.startswith("vision_model."):
+            # Map vision_model.* to visual.* to match the C++ registration
+            temp_key = key.replace("vision_model.", "visual.")
+            
+            # Further map specific vision parameters based on typical vision transformer structures
+            # Map layer norm parameters
+            temp_key = temp_key.replace(".ln_1.", ".norm1.")  # LayerNorm in attention block
+            temp_key = temp_key.replace(".ln_2.", ".norm2.")  # LayerNorm in mlp block
+            temp_key = temp_key.replace(".ln.", ".norm1.")    # General layer norm mapping
+            
+            # Map attention parameters
+            temp_key = temp_key.replace(".attn.", ".attn.")
+            temp_key = temp_key.replace(".qkv.", ".qkv.")
+            temp_key = temp_key.replace(".proj.", ".proj.")
+            
+            # Map MLP parameters
+            temp_key = temp_key.replace(".mlp.", ".mlp.")
+            temp_key = temp_key.replace(".fc1.", ".fc1.")
+            temp_key = temp_key.replace(".fc2.", ".fc2.")
+            
+            new_key = temp_key
+        
+        # Map resampler (lives under model.resampler_model.* in HF) -> visual.merger.*
+        elif key.startswith("model.resampler_model."):
+            new_key = key.replace("model.resampler_model.", "visual.merger.", 1)
+
+        # Handle text model parameters
+        elif key.startswith("language_model.") or key.startswith("model."):
+            # Handle text model specific mappings
+            # Map attention parameters for text model
+            new_key = key.replace("self_attn.q_proj.", "self_attn.q_proj.")
+            new_key = new_key.replace("self_attn.k_proj.", "self_attn.k_proj.")
+            new_key = new_key.replace("self_attn.v_proj.", "self_attn.v_proj.")
+            new_key = new_key.replace("self_attn.o_proj.", "self_attn.o_proj.")
+            new_key = new_key.replace("mlp.gate_proj.", "mlp.gate_proj.")
+            new_key = new_key.replace("mlp.up_proj.", "mlp.up_proj.")
+            new_key = new_key.replace("mlp.down_proj.", "mlp.down_proj.")
+        
+        # Standard dtype handling for tensors that need dtype conversion
+        if tensor.dtype == torch.float32:
+            # Check if this is a weight or bias that should be converted to bfloat16
+            if new_key.endswith(('.weight', '.bias')):
+                # Convert to expected dtype if needed
+                if config and config.get("torch_dtype") == "bfloat16":
+                    tensor = tensor.to(torch.bfloat16)
+                elif hasattr(config, 'get') and config.get('dtype') == 'bfloat16':
+                    tensor = tensor.to(torch.bfloat16)
+        
+        result[new_key] = tensor
+
+    # after_norm in ERNIE-4.5-VL resampler is LayerNorm without bias in the checkpoint.
+    # infinicore::nn::LayerNorm requires bias -> synthesize a zeros bias so loading
+    # succeeds. Mathematically equivalent to nn.LayerNorm(bias=False).
+    after_norm_w = result.get("visual.merger.after_norm.weight")
+    if after_norm_w is not None and "visual.merger.after_norm.bias" not in result:
+        result["visual.merger.after_norm.bias"] = torch.zeros_like(after_norm_w)
+
+    return result
+
+
 # Model type → remap function mapping
 _WEIGHT_REMAPPER = {
     "glm4": _remap_glm4,
     "chatglm": _remap_chatglm,
     "baichuan": _remap_baichuan,
+    "ernie4_5_moe_vl": _remap_ernie4_5_vl,  # Add ERNIE-4.5-VL mapping
 }

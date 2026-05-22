@@ -3,7 +3,10 @@
 #include "../global_state/global_state.hpp"
 #include "../models/model_factory.hpp"
 #include "../models/models_registry.hpp"
+#include "../utils.hpp"
 #include "infinicore/ops.hpp"
+#include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
@@ -378,6 +381,48 @@ void RankWorker::thread_loop() {
 
                             for (auto i{decltype(n_req)(0)}; i < n_req; ++i) {
                                 auto score{logits->view({batch_size * total_len, vocab_size})->narrow({{0, size_t(input_offsets[i + 1] - 1), 1}})->view({vocab_size})};
+
+                                // Debug: print logit distribution on first decode step.
+                                static bool _debug_printed = false;
+                                if (!_debug_printed) {
+                                    _debug_printed = true;
+                                    auto score_cpu = score->to(infinicore::Device::cpu())->contiguous();
+                                    std::vector<float> sf(vocab_size);
+                                    if (score_cpu->dtype() == infinicore::DataType::BF16) {
+                                        const uint16_t *raw = reinterpret_cast<const uint16_t *>(score_cpu->data());
+                                        for (size_t j = 0; j < vocab_size; ++j) sf[j] = bf16_to_f32(raw[j]);
+                                    } else {
+                                        const float *raw = reinterpret_cast<const float *>(score_cpu->data());
+                                        for (size_t j = 0; j < vocab_size; ++j) sf[j] = raw[j];
+                                    }
+                                    float min_val = sf[0], max_val = sf[0], sum = 0.f;
+                                    bool has_nan = false, has_inf = false;
+                                    std::vector<std::pair<float, size_t>> top5;
+                                    top5.reserve(5);
+                                    for (size_t j = 0; j < vocab_size; ++j) {
+                                        float v = sf[j];
+                                        if (std::isnan(v)) has_nan = true;
+                                        if (std::isinf(v)) has_inf = true;
+                                        if (v < min_val) min_val = v;
+                                        if (v > max_val) max_val = v;
+                                        sum += v;
+                                        if (top5.size() < 5) {
+                                            top5.push_back({v, j});
+                                            std::sort(top5.begin(), top5.end(), [](auto &a, auto &b){ return a.first > b.first; });
+                                        } else if (v > top5.back().first) {
+                                            top5.back() = {v, j};
+                                            std::sort(top5.begin(), top5.end(), [](auto &a, auto &b){ return a.first > b.first; });
+                                        }
+                                    }
+                                    spdlog::info("[LOGIT DEBUG] vocab={} min={:.3f} max={:.3f} mean={:.3f} has_nan={} has_inf={}",
+                                        vocab_size, min_val, max_val, sum / static_cast<float>(vocab_size), has_nan, has_inf);
+                                    spdlog::info("[LOGIT DEBUG] score[0]={:.3f} score[1]={:.3f} score[2]={:.3f} score[3]={:.3f}",
+                                        sf[0], sf[1], sf[2], sf[3]);
+                                    for (size_t k = 0; k < top5.size(); ++k) {
+                                        spdlog::info("[LOGIT DEBUG] top{}: token_id={} logit={:.4f}", k+1, top5[k].second, top5[k].first);
+                                    }
+                                }
+
                                 auto out{output_ids->narrow({{0, i, 1}})->view({})};
                                 float random_val = std::uniform_real_distribution<float>(0, 1)(rng_);
                                 infinicore::op::random_sample_(
