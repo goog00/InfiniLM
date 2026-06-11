@@ -2,6 +2,7 @@
 
 #include "../../global_state/global_state.hpp"
 #include "../../utils.hpp"
+#include "infinicore/context/context.hpp"
 #include "infinicore/ops.hpp"
 #include "infinicore/ops/distributed/allreduce.hpp"
 
@@ -134,10 +135,17 @@ infinicore::Tensor Qwen3MoeExperts::forward(const infinicore::Tensor &hidden_sta
     auto permuted_hidden = infinicore::op::embedding(perm_token_dev, hidden_states);
 
     // ---- Step 5: per-projection grouped GEMMs.
-    auto gate_out = infinicore::op::grouped_gemm(permuted_hidden, gate_proj_stacked_, counts_dev);
-    auto up_out = infinicore::op::grouped_gemm(permuted_hidden, up_proj_stacked_, counts_dev);
+    // `counts` already lives on the host (computed in Step 2), so we hand it to
+    // grouped_gemm directly: device backends then skip the per-call device->host
+    // copy + stream sync of the group sizes. On MetaX that copy is effectively a
+    // hard sync, so this removes 3 hard syncs per layer on the decode path.
+    // Under graph recording the op runs at replay time, after this local
+    // `counts` vector is gone; pass nullptr there so the device-sync path is used.
+    const int32_t *counts_host = infinicore::context::isGraphRecording() ? nullptr : counts.data();
+    auto gate_out = infinicore::op::grouped_gemm(permuted_hidden, gate_proj_stacked_, counts_dev, 1.0f, 0.0f, counts_host);
+    auto up_out = infinicore::op::grouped_gemm(permuted_hidden, up_proj_stacked_, counts_dev, 1.0f, 0.0f, counts_host);
     auto intermediate = infinicore::op::swiglu(up_out, gate_out);
-    auto down_out = infinicore::op::grouped_gemm(intermediate, down_proj_stacked_, counts_dev);
+    auto down_out = infinicore::op::grouped_gemm(intermediate, down_proj_stacked_, counts_dev, 1.0f, 0.0f, counts_host);
 
     // ---- Step 6: scale each row by its routing weight (broadcast over hidden).
     auto weight_broadcast = perm_weight_dev->as_strided(
