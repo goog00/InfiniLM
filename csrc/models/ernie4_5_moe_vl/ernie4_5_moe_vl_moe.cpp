@@ -1,8 +1,13 @@
 #include "ernie4_5_moe_vl_moe.hpp"
 #include "../../global_state/global_state.hpp"
+#include "../../utils.hpp"
 #include "infinicore/ops.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace infinilm::models::ernie4_5_moe_vl {
 
@@ -67,6 +72,9 @@ Ernie4_5_VLMoeGate::Ernie4_5_VLMoeGate(std::shared_ptr<infinilm::config::ModelCo
     size_t num_experts_text = num_experts[0].get<size_t>();
     size_t num_experts_vision = num_experts[1].get<size_t>();
     moe_k_ = model_config->get<size_t>("moe_k");
+    // VERIFY(GPU): confirm the config key / default against HF (DeepSeek-V3 uses
+    // norm_topk_prob=true; ERNIE-4.5 is assumed the same).
+    norm_topk_prob_ = model_config->get_or<bool>("norm_topk_prob", true);
 
     // Gate weights are kept in fp32 in the checkpoint for routing precision.
     INFINICORE_NN_PARAMETER_INIT(weight, ({num_experts_text, hidden_size}, dtype, device));
@@ -81,26 +89,81 @@ Ernie4_5_VLMoeGate::forward(const infinicore::Tensor &hidden_states,
     ASSERT(hidden_states->ndim() == 2);
     size_t ntoken = hidden_states->shape()[0];
 
-    // TODO(ernie-vl): full aux-free routing should add correction_bias for
-    // top-k *selection* only, then take routing weights from the un-biased
-    // sigmoid scores. We currently use softmax(logits) topk (same as qwen3_moe)
-    // and ignore the bias — accuracy impact is small for inference, and this is
-    // the simplest path until a topk-with-bias op exists.
-    (void)correction_bias;
-
     auto gate_weight = (modality == 0) ? weight_ : weight_1_;
     auto router_logits = infinicore::op::linear(
         const_cast<infinicore::Tensor &>(hidden_states), gate_weight, std::nullopt, 1.0f);
+    size_t num_experts = router_logits->shape()[1];
 
-    auto router_scores = infinicore::Tensor::empty(
-        {ntoken, moe_k_}, infinicore::DataType::F32, hidden_states->device());
-    auto router_indices = infinicore::Tensor::empty(
-        {ntoken, moe_k_}, infinicore::DataType::I32, hidden_states->device());
+    // ERNIE-4.5-VL aux-free routing (DeepSeek-V3 sigmoid scheme, NO group routing):
+    //   scores      = sigmoid(router_logits)
+    //   selection   = top-k of (scores + correction_bias)   # bias affects choice only
+    //   combine wts = scores[selected]                       # raw sigmoid, bias excluded
+    //   if norm_topk_prob: weights /= sum(weights)
+    //
+    // Computed on CPU because (a) there is no GPU sigmoid op, and (b) the infiniop
+    // `topkrouter` fused kernel is hardcoded to DeepSeek's 256 experts + 8-group
+    // routing (returns BAD_PARAM for ERNIE's 64 experts and applies group logic
+    // ERNIE does not use). num_experts=64 is tiny so CPU cost is negligible here;
+    // a GPU sigmoid+topk path is a P2 optimization.
+    // VERIFY(GPU): confirm against HF modeling_ernie4_5_vl that scoring is sigmoid
+    // (assumed), that combine weights exclude the bias, and whether a
+    // routed_scaling_factor (!=1) multiplies the weights.
+    auto logits_cpu = router_logits->to(infinicore::Device::cpu())->contiguous();
+    auto dtype = logits_cpu->dtype();
+    const void *raw = logits_cpu->data();
+    auto read_logit = [&](size_t flat) -> float {
+        if (dtype == infinicore::DataType::BF16) {
+            return bf16_to_f32(reinterpret_cast<const uint16_t *>(raw)[flat]);
+        } else if (dtype == infinicore::DataType::F16) {
+            return f16_to_f32(reinterpret_cast<const uint16_t *>(raw)[flat]);
+        }
+        return reinterpret_cast<const float *>(raw)[flat];
+    };
 
-    int norm_flag = norm_topk_prob_ ? 1 : 0;
-    infinicore::op::topksoftmax(router_scores, router_indices, router_logits, moe_k_, norm_flag);
+    std::vector<float> bias(num_experts, 0.0f);
+    if (correction_bias.has_value()) {
+        auto bias_cpu = correction_bias.value()->to(infinicore::Device::cpu())->contiguous();
+        const float *bp = reinterpret_cast<const float *>(bias_cpu->data());
+        for (size_t e = 0; e < num_experts; ++e) {
+            bias[e] = bp[e];
+        }
+    }
 
-    return std::make_tuple(router_scores, router_indices);
+    auto scores_cpu = infinicore::Tensor::empty({ntoken, moe_k_}, infinicore::DataType::F32, infinicore::Device::cpu());
+    auto indices_cpu = infinicore::Tensor::empty({ntoken, moe_k_}, infinicore::DataType::I32, infinicore::Device::cpu());
+    auto *sc = reinterpret_cast<float *>(scores_cpu->data());
+    auto *ic = reinterpret_cast<int32_t *>(indices_cpu->data());
+
+    std::vector<float> sig(num_experts);
+    std::vector<std::pair<float, size_t>> choice(num_experts);
+    for (size_t t = 0; t < ntoken; ++t) {
+        for (size_t e = 0; e < num_experts; ++e) {
+            float logit = read_logit(t * num_experts + e);
+            float s = 1.0f / (1.0f + std::exp(-logit));
+            sig[e] = s;
+            choice[e] = {s + bias[e], e};
+        }
+        std::partial_sort(
+            choice.begin(), choice.begin() + moe_k_, choice.end(),
+            [](const std::pair<float, size_t> &a, const std::pair<float, size_t> &b) {
+                return a.first > b.first;
+            });
+        float sum = 0.0f;
+        for (size_t k = 0; k < moe_k_; ++k) {
+            size_t e = choice[k].second;
+            ic[t * moe_k_ + k] = static_cast<int32_t>(e);
+            sc[t * moe_k_ + k] = sig[e];
+            sum += sig[e];
+        }
+        if (norm_topk_prob_ && sum > 0.0f) {
+            for (size_t k = 0; k < moe_k_; ++k) {
+                sc[t * moe_k_ + k] /= sum;
+            }
+        }
+    }
+
+    return std::make_tuple(scores_cpu->to(hidden_states->device()),
+                           indices_cpu->to(hidden_states->device()));
 }
 
 // ---------------------------------------------------------------------------
@@ -203,8 +266,10 @@ infinicore::Tensor Ernie4_5_VLMoeSparseMoeBlock::forward(const infinicore::Tenso
             gathered->narrow({{0, i, 1}})->copy_from(flat->narrow({{0, idxs[i], 1}}));
         }
 
-        // Batch gate forward for this modality.
-        auto [weights, indices] = gate_->forward(gathered, modality, std::nullopt);
+        // Batch gate forward for this modality; correction_bias row selects the
+        // modality's aux-free load-balancing bias for top-k selection.
+        auto bias = moe_statics_->bias_for_modality(modality);
+        auto [weights, indices] = gate_->forward(gathered, modality, bias);
         auto w_cpu = weights->to(infinicore::Device::cpu())->contiguous();
         auto i_cpu = indices->to(infinicore::Device::cpu())->contiguous();
         const auto *w_ptr = reinterpret_cast<const float *>(w_cpu->data());

@@ -2,6 +2,9 @@
 
 #include "../../layers/common_modules.hpp"
 
+#include <tuple>
+#include <vector>
+
 namespace infinilm::models::ernie4_5_moe_vl {
 
 // Text-side self-attention for ERNIE-4.5-VL-MoE.
@@ -35,6 +38,14 @@ private:
     infinicore::Tensor forward_paged_(const infinicore::Tensor &positions,
                                       const infinicore::Tensor &hidden_states) const;
 
+    // Build per-token 3D-mrope sin/cos tables [seq, head_dim/2] plus a [seq]
+    // position index (arange), so op::rope can be reused: each table row already
+    // encodes the multi-axis (time,height,width) rotation for that token.
+    std::tuple<infinicore::Tensor, infinicore::Tensor, infinicore::Tensor>
+    build_mrope_(const infinicore::Tensor &position_ids,
+                 const infinicore::DataType &dtype,
+                 const infinicore::Device &device) const;
+
 protected:
     std::shared_ptr<infinilm::layers::linear::QKVParallelLinear> qkv_proj_;
     std::shared_ptr<infinilm::layers::linear::RowParallelLinear> o_proj_;
@@ -47,6 +58,12 @@ protected:
     size_t num_key_value_heads_;
     size_t hidden_size_;
     size_t head_dim_;
+
+    // 3D mrope (rope_scaling.mrope_section, e.g. [22,22,20] summing to head_dim/2).
+    // Empty -> plain 1D rope via rotary_emb_.
+    std::vector<size_t> mrope_section_;
+    double rope_theta_{0.0};
+    infinicore::nn::RoPE::Algo rope_algo_{infinicore::nn::RoPE::Algo::GPT_NEOX};
 
     // For off-line kv cache quantization.
     INFINICORE_NN_PARAMETER(kv_cache_k_scale);

@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <optional>
+#include <tuple>
 #include <vector>
 
 namespace infinilm::models::ernie4_5_moe_vl {
@@ -42,11 +43,15 @@ public:
                              const infinicore::DataType &dtype,
                              const infinicore::Device &device);
 
-    // rotary_pos_emb: precomputed 2D rope (cos/sin) for the patch grid.
-    // cu_seqlens: per-image boundaries for block-diagonal attention (attn_sep).
+    // sin_tbl/cos_tbl: precomputed 2D-rope tables [num_patches, head_dim/2].
+    // pos_index: [num_patches] arange selecting the table row per patch.
+    // cu_seqlens: per-image patch boundaries [num_img+1] for block-diagonal
+    // attention (attn_sep) — attention runs independently within each segment.
     infinicore::Tensor forward(const infinicore::Tensor &hidden_states,
-                               const std::optional<infinicore::Tensor> &rotary_pos_emb,
-                               const std::optional<infinicore::Tensor> &cu_seqlens) const;
+                               const infinicore::Tensor &sin_tbl,
+                               const infinicore::Tensor &cos_tbl,
+                               const infinicore::Tensor &pos_index,
+                               const std::vector<int64_t> &cu_seqlens) const;
 
 private:
     size_t embed_dim_;
@@ -80,8 +85,10 @@ public:
                          const infinicore::Device &device);
 
     infinicore::Tensor forward(const infinicore::Tensor &hidden_states,
-                               const std::optional<infinicore::Tensor> &rotary_pos_emb,
-                               const std::optional<infinicore::Tensor> &cu_seqlens) const;
+                               const infinicore::Tensor &sin_tbl,
+                               const infinicore::Tensor &cos_tbl,
+                               const infinicore::Tensor &pos_index,
+                               const std::vector<int64_t> &cu_seqlens) const;
 
 private:
     INFINICORE_NN_MODULE(infinicore::nn::LayerNorm, norm1);
@@ -110,13 +117,22 @@ public:
                                const infinicore::Tensor &grid_thw) const;
 
 private:
-    // Builds the 2D rotary embedding table for the given patch grid.
-    infinicore::Tensor rot_pos_emb(const infinicore::Tensor &grid_thw) const;
+    // Build DFNRope 2D-rope tables [num_patches, head_dim/2] (height freqs ++ width
+    // freqs) and a [num_patches] arange index. Each patch's (h,w) grid coordinate
+    // drives the two halves; reused via op::rope (NEOX rotate_half).
+    std::tuple<infinicore::Tensor, infinicore::Tensor, infinicore::Tensor>
+    build_rope_(const infinicore::Tensor &grid_thw,
+                const infinicore::DataType &dtype,
+                const infinicore::Device &device) const;
+
+    // Per-image patch boundaries [num_img+1] (host) for block-diagonal attention.
+    std::vector<int64_t> build_cu_seqlens_(const infinicore::Tensor &grid_thw) const;
 
     size_t embed_dim_;
     size_t num_heads_;
     size_t head_dim_;
     size_t spatial_merge_size_;
+    double rope_theta_vision_{10000.0};
 
     INFINICORE_NN_MODULE(Ernie4_5_VisionPatchEmbed, patch_embed);
     INFINICORE_NN_MODULE_VEC(Ernie4_5_VisionBlock, blocks);

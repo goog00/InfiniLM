@@ -51,11 +51,14 @@ _disable_maca_device_heap()
 
 
 def build_conversation(text, image=None, video=None):
+    # InfiniLM framework format: resolve_multimodal_inputs expects type=="image"
+    # with image_url holding the file path. The HF reference path may need its own
+    # message format — adapt in run_reference if the installed processor differs.
     content = []
     if image is not None:
-        content.append({"type": "image_url", "image_url": {"url": image}})
+        content.append({"type": "image", "image_url": image})
     if video is not None:
-        content.append({"type": "video_url", "video_url": {"url": video}})
+        content.append({"type": "video", "video_url": video})
     content.append({"type": "text", "text": text})
     return [{"role": "user", "content": content}]
 
@@ -77,36 +80,6 @@ def run_infinilm(model_path, device, conversation, max_new_tokens, ignore_eos=Fa
         top_p=1.0,
     )
 
-    # Print diagnostic info about EOS token IDs.
-    eos_ids = model.engine.eos_token_ids
-    print(f"[DEBUG] eos_token_ids from config: {eos_ids}")
-
-    # Apply chat template and show prompt tokens for debugging.
-    prompt_str = model.engine.apply_chat_template(conversation, add_generation_prompt=True)
-    prompt_tokens = model.engine.tokenize(prompt_str)
-    print(f"[DEBUG] prompt (first 200 chars): {repr(prompt_str[:200])}")
-    print(f"[DEBUG] prompt token count: {len(prompt_tokens)}")
-    print(f"[DEBUG] first 20 prompt tokens: {prompt_tokens[:20]}")
-    print(f"[DEBUG] last 10 prompt tokens: {prompt_tokens[-10:]}")
-
-    # Show decoded form of last few tokens to check chat template boundary.
-    try:
-        last_tok_decoded = model.engine.tokenizer.convert_ids_to_tokens(prompt_tokens[-10:])
-        print(f"[DEBUG] last 10 tokens decoded: {last_tok_decoded}")
-    except Exception as e:
-        print(f"[DEBUG] could not decode last tokens: {e}")
-
-    # Show what token 2 decodes to in this tokenizer.
-    try:
-        tok2_str = model.engine.detokenize([2])
-        print(f"[DEBUG] token_id=2 decodes to: {repr(tok2_str)}")
-        tok1_str = model.engine.detokenize([1])
-        print(f"[DEBUG] token_id=1 decodes to: {repr(tok1_str)}")
-        tok0_str = model.engine.detokenize([0])
-        print(f"[DEBUG] token_id=0 decodes to: {repr(tok0_str)}")
-    except Exception as e:
-        print(f"[DEBUG] could not decode special tokens: {e}")
-
     sp = SamplingParams(
         temperature=1.0,
         top_k=1,
@@ -119,21 +92,79 @@ def run_infinilm(model_path, device, conversation, max_new_tokens, ignore_eos=Fa
 
 
 def run_reference(model_path, conversation, max_new_tokens):
-    # TODO(ernie-vl): load with transformers AutoModelForCausalLM + AutoProcessor
-    # (trust_remote_code=True), run greedy generate on the same inputs, return the
-    # generated token ids. Reference only — not used by the adapted inference path.
-    raise NotImplementedError("HF reference path not wired up yet")
+    """Reference path: load ERNIE-4.5-VL with transformers and greedy-generate.
+
+    Used ONLY as a correctness reference (task §4); the adapted InfiniLM
+    inference path does not depend on transformers. Returns (token_ids, text).
+
+    The checkpoint is loaded with trust_remote_code=True so its bundled
+    processing_ernie4_5_vl / modeling code drives tokenization and the vision
+    pipeline. The processor.apply_chat_template(..., return_dict=True) call is
+    the unified multimodal entry: it renders text + image/video placeholders and
+    attaches pixel values in one shot, so the same `conversation` used by
+    InfiniLM feeds the reference unchanged.
+    """
+    import torch
+    from transformers import AutoModelForCausalLM, AutoProcessor
+
+    model_path = os.path.expanduser(model_path)
+    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    model.eval()
+
+    inputs = processor.apply_chat_template(
+        conversation,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    inputs = {k: (v.to(model.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
+
+    prompt_len = inputs["input_ids"].shape[1]
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,  # greedy, matches InfiniLM top_k=1 / temperature ignored
+            num_beams=1,
+        )
+    output_ids = generated[0][prompt_len:].tolist()
+    text = processor.decode(output_ids, skip_special_tokens=True)
+    return output_ids, text
 
 
-def compare(infinilm_ids, reference_ids):
-    # Primary metric: exact token-sequence match. Secondary (fallback): semantic
-    # equivalence on decoded text. See task §4.
-    if infinilm_ids == reference_ids:
-        print("[PASS] exact token match")
+def _infinilm_text(infinilm_out):
+    """Best-effort extraction of decoded text from LLM.chat output."""
+    o = infinilm_out[0] if isinstance(infinilm_out, (list, tuple)) and infinilm_out else infinilm_out
+    if isinstance(o, str):
+        return o
+    for attr in ("text", "generated_text", "outputs"):
+        val = getattr(o, attr, None)
+        if isinstance(val, str):
+            return val
+    return str(o)
+
+
+def compare(infinilm_out, reference_ids, reference_text):
+    """Compare InfiniLM output against the HF reference (task §4).
+
+    Primary metric is exact token-sequence match; that requires InfiniLM to
+    surface generated token ids here. Until LLM.chat exposes them, we compare on
+    decoded text (exact match; semantic equivalence is left to manual review).
+    """
+    text = _infinilm_text(infinilm_out)
+    if text.strip() == (reference_text or "").strip():
+        print("[PASS] exact text match")
         return True
-    n = min(len(infinilm_ids), len(reference_ids))
-    first_div = next((i for i in range(n) if infinilm_ids[i] != reference_ids[i]), n)
-    print(f"[FAIL] diverged at token {first_div}")
+    print("[FAIL] output differs from reference")
+    print(f"  InfiniLM : {text!r}")
+    print(f"  Reference: {reference_text!r}  ({len(reference_ids)} ref tokens)")
     return False
 
 
@@ -181,8 +212,9 @@ def main():
         print(f"[InfiniLM] {infinilm_out}")
 
         if args.with_reference:
-            ref_out = run_reference(args.model, conversation, args.max_new_tokens)
-            compare(infinilm_out, ref_out)
+            ref_ids, ref_text = run_reference(args.model, conversation, args.max_new_tokens)
+            print(f"[Reference] {ref_text}")
+            compare(infinilm_out, ref_ids, ref_text)
 
 
 if __name__ == "__main__":

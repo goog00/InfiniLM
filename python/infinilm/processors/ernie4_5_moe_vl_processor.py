@@ -46,6 +46,9 @@ class Ernie4_5_VLMoeProcessor(BasicLLMProcessor):
         with open(os.path.join(model_dir_path, "config.json")) as f:
             cfg = json.load(f)
 
+        # Model compute dtype (pixel_values must match the vision weights).
+        self._config_dtype = cfg.get("torch_dtype", "bfloat16")
+
         # Special token ids for vision placeholders / span markers.
         self.im_patch_id = cfg.get("im_patch_id", 100295)
         self.image_start_token_id = cfg.get("image_start_token_id", 101304)
@@ -60,9 +63,18 @@ class Ernie4_5_VLMoeProcessor(BasicLLMProcessor):
         self.temporal_conv_size = cfg.get("temporal_conv_size", 2)
         self.spatial_conv_size = cfg.get("spatial_conv_size", 2)
 
+    # Literal markers kept in the rendered prompt string so __call__ can splice the
+    # exact number of patch-placeholder tokens per media item. They must not collide
+    # with real text; __call__ splits the prompt on them.
+    IMAGE_SENTINEL = "<|__ernie_vl_image__|>"
+    VIDEO_SENTINEL = "<|__ernie_vl_video__|>"
+
     # ------------------------------------------------------------------
-    # Chat template: defer to parent for pure-text conversations; multimodal
-    # rendering (with image/video placeholders) is the next task.
+    # Chat template: pure text defers to parent. For multimodal we render each
+    # media item to a sentinel marker (role structure still from the tokenizer
+    # template) and let __call__ replace each sentinel with image_start +
+    # im_patch * N + image_end token ids. Returns a STRING (tokenize is ignored
+    # for the multimodal path; the LLM pipeline tokenizes via __call__).
     # ------------------------------------------------------------------
     def apply_chat_template(
         self,
@@ -79,11 +91,32 @@ class Ernie4_5_VLMoeProcessor(BasicLLMProcessor):
                 **kwargs,
             )
 
-        # TODO(ernie-vl): render image/video items into <|IMAGE_START|>+im_patch*N+
-        # <|IMAGE_END|> spans according to the tokenizer's chat template. The
-        # placeholder count must match the patch count produced by _preprocess_*.
-        raise NotImplementedError(
-            "Ernie4_5_VLMoeProcessor.apply_chat_template: multimodal rendering not yet implemented"
+        normalized = []
+        for message in conversation:
+            content = message.get("content")
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    t = item.get("type", "text")
+                    if t == "text":
+                        parts.append(item.get("text", ""))
+                    elif t in ("image", "image_url"):
+                        parts.append(self.IMAGE_SENTINEL)
+                    elif t in ("video", "video_url"):
+                        parts.append(self.VIDEO_SENTINEL)
+                    else:
+                        raise ValueError(f"Unsupported content item type: {t}")
+                normalized.append({"role": message["role"], "content": "".join(parts)})
+            else:
+                normalized.append(message)
+
+        # tokenize=False: keep sentinels as literal text; __call__ re-tokenizes and
+        # splices placeholder token ids.
+        return self.tokenizer.apply_chat_template(
+            conversation=normalized,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=False,
+            **kwargs,
         )
 
     # ------------------------------------------------------------------
@@ -102,20 +135,54 @@ class Ernie4_5_VLMoeProcessor(BasicLLMProcessor):
         if not images and not videos:
             return super().__call__(prompt, return_tensors=return_tensors, **kwargs)
 
-        # Multimodal path — fall through to local processing.
-        encoding = self.tokenizer(prompt, add_special_tokens=False)
-        result = {"input_ids": encoding["input_ids"]}
-
-        if images:
-            pixel_values, grid_thw = self._preprocess_images(images)
-            result["pixel_values"] = pixel_values
-            result["grid_thw"] = grid_thw
         if videos:
-            pixel_values_v, grid_thw_v = self._preprocess_videos(videos)
-            result["pixel_values_videos"] = pixel_values_v
-            result["video_grid_thw"] = grid_thw_v
+            # Video preprocessing is not yet wired (see _preprocess_videos).
+            raise NotImplementedError("Ernie4_5_VLMoeProcessor: video input not yet supported")
 
-        return result
+        # Image path: preprocess to patches + grid, then assemble input_ids by
+        # splicing image_start + im_patch * N + image_end at each sentinel.
+        pixel_values, grid_thw, merged_counts = self._preprocess_images(images)
+        input_ids = self._assemble_input_ids(prompt, merged_counts)
+
+        return {
+            "input_ids": self._wrap_input_ids(input_ids, return_tensors),
+            "pixel_values": pixel_values,
+            "grid_thw": grid_thw,
+        }
+
+    def _assemble_input_ids(self, prompt, merged_counts):
+        """Tokenize text segments and splice image placeholder spans.
+
+        For image i, insert image_start + im_patch * merged_counts[i] + image_end at
+        the sentinel position. merged_counts[i] equals the number of vision tokens the
+        tower emits, so the C++ merge_vision_embeddings scatters them 1:1 onto the
+        im_patch positions.
+        VERIFY: confirm ERNIE wraps the patch run with image_start/end (vs no wrap)
+        and that segment-wise tokenization matches whole-string tokenization at the
+        sentinel boundaries.
+        """
+        segments = prompt.split(self.IMAGE_SENTINEL)
+        if len(segments) - 1 != len(merged_counts):
+            raise ValueError(
+                f"image sentinel count {len(segments) - 1} != image count {len(merged_counts)}"
+            )
+        ids = []
+        for i, seg in enumerate(segments):
+            if seg:
+                ids.extend(self.tokenizer(seg, add_special_tokens=False)["input_ids"])
+            if i < len(merged_counts):
+                ids.append(self.image_start_token_id)
+                ids.extend([self.im_patch_id] * merged_counts[i])
+                ids.append(self.image_end_token_id)
+        return ids
+
+    @staticmethod
+    def _wrap_input_ids(ids, return_tensors):
+        if return_tensors == "pt":
+            import torch
+
+            return torch.tensor([ids], dtype=torch.long)
+        return ids
 
     # ------------------------------------------------------------------
     # Multimodal preprocessing.
@@ -190,16 +257,20 @@ class Ernie4_5_VLMoeProcessor(BasicLLMProcessor):
 
         pixel_values_list = []
         grid_thw_list = []
+        merged_counts = []
+        block = self.spatial_conv_size * self.spatial_conv_size
         for image_input in images:
             pil = self._load_image(image_input)
             chw = self._normalize_image(pil)
             patches, h, w = self._patchify_frame(chw)
             pixel_values_list.append(patches)
             grid_thw_list.append([1, h, w])
+            # Vision tokens after the resampler's spatial merge (t==1 image).
+            merged_counts.append((h * w) // block)
 
         pixel_values = np.concatenate(pixel_values_list, axis=0)
         grid_thw = np.asarray(grid_thw_list, dtype=np.int64)
-        return pixel_values, grid_thw
+        return pixel_values, grid_thw, merged_counts
 
     def _preprocess_videos(self, videos: list):
         # TODO(ernie-vl): decode video (decord / av / cv2), sample frames at a
@@ -209,15 +280,96 @@ class Ernie4_5_VLMoeProcessor(BasicLLMProcessor):
         # so we defer until the image path is validated end-to-end.
         raise NotImplementedError("Ernie4_5_VLMoeProcessor._preprocess_videos")
 
-    def _build_3d_position_ids(self, input_ids, grid_thw=None):
-        """Produce position_ids of shape [3, seq_len] = (time, height, width).
+    def _build_3d_position_ids(self, input_ids, grid_thw):
+        """Qwen2-VL-style get_rope_index -> [3][seq] = (time, height, width).
 
-        Initial implementation: replicate the 1D text positions across all three
-        rows. This makes the model behave like standard 1D RoPE and matches the
-        attention.cpp fallback that currently takes row 0 only. Full mrope (with
-        per-axis advancement for vision tokens) is wired up in a later pass —
-        see the 3D mrope TODO in attention.cpp.
+        Text tokens advance sequentially on all three axes. Each im_patch run gets
+        2D (height,width) grid positions offset by the running start; the next text
+        token resumes from max(position)+1. The merged grid uses spatial_conv_size
+        (the resampler's spatial merge): hh=h//s, ww=w//s.
+        VERIFY: match HF modeling_ernie4_5_vl.get_rope_index (axis order + the
+        position offset accounting after each image span).
         """
-        seq_len = len(input_ids)
-        row = list(range(seq_len))
-        return [row, row, row]
+        s = self.spatial_conv_size
+        grids = grid_thw.tolist() if hasattr(grid_thw, "tolist") else list(grid_thw)
+        tpos, hpos, wpos = [], [], []
+        st = 0
+        img_idx = 0
+        i = 0
+        n = len(input_ids)
+        while i < n:
+            if input_ids[i] == self.im_patch_id:
+                t, h, w = grids[img_idx]
+                img_idx += 1
+                hh, ww = int(h) // s, int(w) // s
+                count = int(t) * hh * ww
+                for idx in range(count):
+                    ti = idx // (hh * ww)
+                    rem = idx % (hh * ww)
+                    hi = rem // ww
+                    wi = rem % ww
+                    tpos.append(st + ti)
+                    hpos.append(st + hi)
+                    wpos.append(st + wi)
+                st = st + max(int(t), hh, ww)
+                i += count
+            else:
+                tpos.append(st)
+                hpos.append(st)
+                wpos.append(st)
+                st += 1
+                i += 1
+        return [tpos, hpos, wpos]
+
+    def build_model_inputs(self, scheduler_output, temperature=1.0, top_p=0.8, top_k=1):
+        """Inject multimodal tensors + 3D mrope positions onto the base text inputs.
+
+        Multimodal data lives on the request's processed_inputs (from __call__).
+        pixel_values/tgt_sizes are sent only during prefill (vision is cached after);
+        position_ids are replaced with the [3, seq] mrope layout for the tokens
+        computed this step. Text-only requests fall through to the base unchanged.
+        """
+        base = super().build_model_inputs(scheduler_output, temperature, top_p, top_k)
+
+        reqs = getattr(scheduler_output, "scheduled_requests", None)
+        if not reqs:
+            return base
+        req = reqs[0]
+        pi = getattr(req, "processed_inputs", None)
+        if not pi or pi.get("pixel_values") is None:
+            return base
+
+        import infinicore
+        import numpy as np
+
+        grid_thw = np.asarray(pi["grid_thw"]).astype(np.int64)
+        pos3d = self._build_3d_position_ids(req.get_all_token_ids(), grid_thw)
+
+        if getattr(scheduler_output, "is_prefill", True):
+            prefix = getattr(scheduler_output, "prefix_hit_len", 0) or 0
+            end = len(req.get_input_tokens())
+            pos_slice = [row[prefix:end] for row in pos3d]
+
+            # Flatten patches to [num_patches, C*p*p]; the C++ patch_embed views it
+            # back. Build in model dtype so it matches the vision weights.
+            pv = np.ascontiguousarray(pi["pixel_values"]).astype(np.float32)
+            pv2d = pv.reshape(pv.shape[0], -1)
+            base["pixel_values"] = infinicore.from_list(pv2d.tolist(), dtype=self._infini_dtype())
+            base["tgt_sizes"] = infinicore.from_list(grid_thw.tolist(), dtype=infinicore.int64)
+        else:
+            pos = req.get_total_length() - 1
+            pos_slice = [[row[pos]] for row in pos3d]
+
+        base["position_ids"] = infinicore.from_list(pos_slice, dtype=infinicore.int64)
+        return base
+
+    def _infini_dtype(self):
+        """Model compute dtype for pixel_values (must match the vision weights)."""
+        import infinicore
+
+        name = (getattr(self, "_config_dtype", "bfloat16") or "bfloat16").lower()
+        return {
+            "bfloat16": infinicore.bfloat16,
+            "float16": infinicore.float16,
+            "float32": infinicore.float32,
+        }.get(name, infinicore.bfloat16)
