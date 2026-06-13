@@ -1,6 +1,10 @@
 #include "ernie4_5_moe_vl_text_model.hpp"
 
+#include "ernie_debug.hpp"
 #include "infinicore/ops.hpp"
+
+#include <cstdint>
+#include <vector>
 
 namespace infinilm::models::ernie4_5_moe_vl {
 
@@ -32,15 +36,24 @@ infinicore::Tensor Ernie4_5_VLMoeModel::forward(const infinilm::InfinilmModel::I
     auto input_ids = input.input_ids.value();
     auto positions = input.position_ids.value();
     auto hidden_states = embed_tokens_->forward(input_ids);
+    ernie_dbg_stats("embed", hidden_states);
 
-    // Text-only path: all tokens are text modality.
-    auto token_type_ids = infinicore::Tensor::zeros(input_ids->shape(), infinicore::DataType::I64, hidden_states->device());
+    // Text-only path: all tokens are text modality (token_type 0). Build the zero
+    // tensor explicitly on CPU then move to device -- Tensor::zeros(I64) on the MetaX
+    // backend does not reliably clear device memory, which left token_type garbage and
+    // routed every token through the vision experts/gate.
+    std::vector<int64_t> tt_zero(input_ids->numel(), 0);
+    auto token_type_ids = infinicore::Tensor::from_blob(
+                              tt_zero.data(), input_ids->shape(),
+                              infinicore::DataType::I64, infinicore::Device::cpu())
+                              ->to(hidden_states->device());
 
     infinicore::Tensor residual;
     for (size_t i = 0; i < layers_.size(); ++i) {
         layers_.at(i)->forward(positions, hidden_states, residual, token_type_ids);
     }
     norm_->forward_inplace(hidden_states, residual);
+    ernie_dbg_stats("final_norm", hidden_states);
     return hidden_states;
 }
 

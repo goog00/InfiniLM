@@ -44,9 +44,13 @@ Ernie4_5_VLMoeAttention::Ernie4_5_VLMoeAttention(std::shared_ptr<infinilm::confi
         "o_proj", total_num_heads * head_dim_, hidden_size_, quantization_method,
         use_bias, dtype, device, tp_rank, tp_size, rank_info.comm);
 
-    // Base 1D RoPE (used directly for text-only positions, and reused for its
-    // GPT-NEOX algo + theta + head_dim when building 3D-mrope tables).
-    rotary_emb_ = infinilm::layers::rotary_embedding::get_rope(model_config, device);
+    // Base 1D RoPE. ERNIE-4.5-VL uses GPT-J / interleaved rotary (HF
+    // RopeEmbedding.apply_rotary: sin_pos=[θ0,θ0,θ1,θ1,...], rotate_half pairs
+    // adjacent dims (q0,q1),(q2,q3),...), NOT the framework-default GPT-NEOX
+    // (half-split). Used directly for text positions and reused (algo+theta+
+    // head_dim) when building the 3D-mrope tables.
+    rotary_emb_ = infinilm::layers::rotary_embedding::get_rope(
+        model_config, device, infinicore::nn::RoPE::Algo::GPT_J);
     rope_algo_ = rotary_emb_->algo();
     rope_theta_ = model_config->get<double>("rope_theta");
     // 3D mrope sections (time,height,width) from rope_scaling.mrope_section, e.g.
@@ -82,16 +86,21 @@ Ernie4_5_VLMoeAttention::build_mrope_(const infinicore::Tensor &position_ids,
 
     size_t cache_dim = head_dim_ / 2;
 
-    // Assign each frequency index to an axis: the first mrope_section[0] freqs use
-    // axis 0 (time), the next mrope_section[1] use axis 1 (height), etc. Sections
-    // sum to cache_dim ([22,22,20] -> 64). Matches Qwen2-VL section->axis split.
+    // Per-frequency axis assignment, matching HF RopeEmbedding.apply_rotary_3d
+    // (NOT a sequential mrope_section split): with freq_allocation = mrope_section
+    // last entry (=20), the low frequencies [0, cache_dim-freq_allocation) alternate
+    // height(even)/width(odd), and the high frequencies [.., cache_dim) are time.
+    //   pos rows: 0 = time, 1 = height, 2 = width  (from processor get_rope_index).
+    // For text (all 3 rows equal) the assignment is irrelevant; it only matters for
+    // image/video where the axes differ.
+    size_t freq_allocation = mrope_section_.empty() ? 0 : mrope_section_.back();
+    size_t split = (freq_allocation <= cache_dim) ? (cache_dim - freq_allocation) : cache_dim;
     std::vector<size_t> axis_of(cache_dim, 0);
-    {
-        size_t j = 0;
-        for (size_t s = 0; s < mrope_section_.size() && j < cache_dim; ++s) {
-            for (size_t c = 0; c < mrope_section_[s] && j < cache_dim; ++c, ++j) {
-                axis_of[j] = s % 3;
-            }
+    for (size_t j = 0; j < cache_dim; ++j) {
+        if (j < split) {
+            axis_of[j] = (j % 2 == 0) ? 1 /*height*/ : 2 /*width*/;
+        } else {
+            axis_of[j] = 0 /*time*/;
         }
     }
 

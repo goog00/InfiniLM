@@ -63,14 +63,14 @@ def build_conversation(text, image=None, video=None):
     return [{"role": "user", "content": content}]
 
 
-def run_infinilm(model_path, device, conversation, max_new_tokens, ignore_eos=False):
+def run_infinilm(model_path, device, conversation, max_new_tokens, ignore_eos=False, tp=1):
     from infinilm.llm.llm import LLM
     from infinilm.llm.sampling_params import SamplingParams
 
     model = LLM(
         model_path=os.path.expanduser(model_path),
         device=device,
-        tensor_parallel_size=1,
+        tensor_parallel_size=tp,
         cache_type="static",
         max_batch_size=1,
         max_tokens=max_new_tokens,
@@ -184,6 +184,9 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=128)
     ap.add_argument("--with-reference", action="store_true")
     ap.add_argument("--cases", default="text,image,video")
+    ap.add_argument("--tp", type=int, default=1,
+                    help="Tensor-parallel size. Use 2 on MetaX C500 ×2 (the 59GB "
+                         "weights do not fit one 64GB card alongside activations/KV).")
     ap.add_argument("--ignore-eos", action="store_true",
                     help="Ignore EOS during generation to see what tokens follow (debug mode).")
     args = ap.parse_args()
@@ -207,7 +210,7 @@ def main():
         conversation = build_conversation(**kw)
         infinilm_out = run_infinilm(
             args.model, args.device, conversation, args.max_new_tokens,
-            ignore_eos=args.ignore_eos,
+            ignore_eos=args.ignore_eos, tp=args.tp,
         )
         print(f"[InfiniLM] {infinilm_out}")
 

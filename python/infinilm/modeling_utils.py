@@ -576,14 +576,16 @@ def _remap_ernie4_5_vl(state_dict, config=None):
     for key, tensor in state_dict.items():
         new_key = key  # 默认保持键不变
         
-        # Handle MoE gate weight transpose issue
+        # Handle MoE gate weight transpose issue. Checkpoint stores the gate as
+        # [hidden, num_experts]; InfiniLM's op::linear expects [num_experts, hidden].
+        # NOTE: .t() returns a non-contiguous (stride-swapped) view; from_torch reads
+        # the raw contiguous buffer, so it MUST be materialized with .contiguous() or
+        # the weight is loaded scrambled (routing then picks the wrong experts).
         if ".mlp.gate.weight" in key:
-            # Transpose the gate weight if shapes don't match expectations
             expected_shape = tensor.shape
-            # Some checkpoints store weights in transposed format
-            if expected_shape[0] > expected_shape[1]:  # e.g., [2560, 64] instead of [64, 2560]
-                tensor = tensor.t()  # Transpose to correct shape
-            
+            if expected_shape[0] > expected_shape[1]:  # e.g., [2560, 64] -> [64, 2560]
+                tensor = tensor.t().contiguous()
+
             # Ensure consistent dtype (convert to bfloat16 as expected by the model)
             if tensor.dtype != torch.bfloat16:
                 tensor = tensor.to(torch.bfloat16)

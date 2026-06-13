@@ -1,5 +1,9 @@
 #include "ernie4_5_moe_vl_decoder_layer.hpp"
 
+#include "ernie_debug.hpp"
+
+#include <string>
+
 namespace infinilm::models::ernie4_5_moe_vl {
 
 bool Ernie4_5_VLMoeDecoderLayer::compute_is_moe_layer(
@@ -43,14 +47,24 @@ Ernie4_5_VLMoeDecoderLayer::forward(const infinicore::Tensor &positions,
                                     infinicore::Tensor &hidden_states,
                                     infinicore::Tensor &residual,
                                     const infinicore::Tensor &token_type_ids) {
+    bool dbg = layer_idx_ < 3;
     input_layernorm_->forward_inplace(hidden_states, residual);
+    if (dbg) ernie_dbg_stats(("L" + std::to_string(layer_idx_) + " in_ln").c_str(), hidden_states);
     hidden_states = self_attn_->forward(positions, hidden_states);
+    if (dbg) ernie_dbg_stats(("L" + std::to_string(layer_idx_) + " attn_out").c_str(), hidden_states);
     post_attention_layernorm_->forward_inplace(hidden_states, residual);
 
     if (is_moe_layer_) {
         hidden_states = moe_block_->forward(hidden_states, token_type_ids);
     } else {
         hidden_states = dense_mlp_->forward(hidden_states);
+    }
+    if (dbg) ernie_dbg_stats(("L" + std::to_string(layer_idx_) + (is_moe_layer_ ? " moe_out" : " dense_out")).c_str(), hidden_states);
+    if (dbg) {
+        // Full residual stream after this layer (= hidden + residual), directly
+        // comparable to HF decoder_layer output[0].
+        auto stream = infinicore::op::add(hidden_states, residual);
+        ernie_dbg_stats(("L" + std::to_string(layer_idx_) + " stream").c_str(), stream);
     }
     return std::make_tuple(hidden_states, residual);
 }

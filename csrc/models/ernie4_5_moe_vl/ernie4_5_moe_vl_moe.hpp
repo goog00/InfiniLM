@@ -77,11 +77,10 @@ public:
             const std::optional<infinicore::Tensor> &correction_bias) const;
 
 protected:
-    INFINICORE_NN_PARAMETER(weight);    // text gate
-    INFINICORE_NN_PARAMETER(weight_1);  // vision gate (TODO: confirm state_dict name)
+    INFINICORE_NN_PARAMETER(weight);    // text gate   (mlp.gate.weight)
+    INFINICORE_NN_PARAMETER(weight_1);  // vision gate (mlp.gate.weight_1)
 
     size_t moe_k_{0};
-    bool norm_topk_prob_{true};
 };
 
 // Thin container for the routed expert list. Registered as "experts" in the

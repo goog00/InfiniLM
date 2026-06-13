@@ -1,7 +1,11 @@
 #include "ernie4_5_moe_vl_moe.hpp"
 #include "../../global_state/global_state.hpp"
 #include "../../utils.hpp"
+#include "ernie_debug.hpp"
 #include "infinicore/ops.hpp"
+
+#include <cstdio>
+#include <cstdlib>
 
 #include <algorithm>
 #include <cmath>
@@ -72,11 +76,10 @@ Ernie4_5_VLMoeGate::Ernie4_5_VLMoeGate(std::shared_ptr<infinilm::config::ModelCo
     size_t num_experts_text = num_experts[0].get<size_t>();
     size_t num_experts_vision = num_experts[1].get<size_t>();
     moe_k_ = model_config->get<size_t>("moe_k");
-    // VERIFY(GPU): confirm the config key / default against HF (DeepSeek-V3 uses
-    // norm_topk_prob=true; ERNIE-4.5 is assumed the same).
-    norm_topk_prob_ = model_config->get_or<bool>("norm_topk_prob", true);
 
-    // Gate weights are kept in fp32 in the checkpoint for routing precision.
+    // Gate weights: checkpoint stores [hidden, num_experts]; the framework loader
+    // transposes linear weights to [out, in], so declare [num_experts, hidden] and
+    // use op::linear (x @ W^T) as usual.
     INFINICORE_NN_PARAMETER_INIT(weight, ({num_experts_text, hidden_size}, dtype, device));
     INFINICORE_NN_PARAMETER_INIT(weight_1, ({num_experts_vision, hidden_size}, dtype, device));
 }
@@ -89,25 +92,23 @@ Ernie4_5_VLMoeGate::forward(const infinicore::Tensor &hidden_states,
     ASSERT(hidden_states->ndim() == 2);
     size_t ntoken = hidden_states->shape()[0];
 
-    auto gate_weight = (modality == 0) ? weight_ : weight_1_;
+    auto gate_weight = (modality == 0) ? weight_ : weight_1_;  // [num_experts, hidden]
     auto router_logits = infinicore::op::linear(
         const_cast<infinicore::Tensor &>(hidden_states), gate_weight, std::nullopt, 1.0f);
     size_t num_experts = router_logits->shape()[1];
 
-    // ERNIE-4.5-VL aux-free routing (DeepSeek-V3 sigmoid scheme, NO group routing):
-    //   scores      = sigmoid(router_logits)
-    //   selection   = top-k of (scores + correction_bias)   # bias affects choice only
-    //   combine wts = scores[selected]                       # raw sigmoid, bias excluded
-    //   if norm_topk_prob: weights /= sum(weights)
+    // ERNIE-4.5-VL aux-free routing (matches HF modeling_ernie4_5_vl
+    // top_k_weight_and_expert, non-group path; gate.act = softmax):
+    //   prob        = softmax(router_logits)                  # over all experts
+    //   selection   = top-k of (prob + correction_bias)       # bias affects choice only
+    //   combine wts = prob[selected]                          # raw softmax prob, bias excluded
+    //   (NO renormalization of the selected weights, and no routed_scaling_factor)
     //
-    // Computed on CPU because (a) there is no GPU sigmoid op, and (b) the infiniop
-    // `topkrouter` fused kernel is hardcoded to DeepSeek's 256 experts + 8-group
-    // routing (returns BAD_PARAM for ERNIE's 64 experts and applies group logic
-    // ERNIE does not use). num_experts=64 is tiny so CPU cost is negligible here;
-    // a GPU sigmoid+topk path is a P2 optimization.
-    // VERIFY(GPU): confirm against HF modeling_ernie4_5_vl that scoring is sigmoid
-    // (assumed), that combine weights exclude the bias, and whether a
-    // routed_scaling_factor (!=1) multiplies the weights.
+    // Computed on CPU because (a) there is no GPU softmax-topk-with-bias op, and
+    // (b) the infiniop `topkrouter` fused kernel is hardcoded to DeepSeek's 256
+    // experts + 8-group routing (returns BAD_PARAM for ERNIE's 64 experts and
+    // applies group logic ERNIE does not use). num_experts=64 is tiny so the CPU
+    // cost is negligible; a GPU softmax+topk path is a P2 optimization.
     auto logits_cpu = router_logits->to(infinicore::Device::cpu())->contiguous();
     auto dtype = logits_cpu->dtype();
     const void *raw = logits_cpu->data();
@@ -134,31 +135,39 @@ Ernie4_5_VLMoeGate::forward(const infinicore::Tensor &hidden_states,
     auto *sc = reinterpret_cast<float *>(scores_cpu->data());
     auto *ic = reinterpret_cast<int32_t *>(indices_cpu->data());
 
-    std::vector<float> sig(num_experts);
+    std::vector<float> logit_t(num_experts);
+    std::vector<float> prob(num_experts);
     std::vector<std::pair<float, size_t>> choice(num_experts);
     for (size_t t = 0; t < ntoken; ++t) {
+        // softmax over all experts (numerically stable).
+        float maxv = read_logit(t * num_experts);
         for (size_t e = 0; e < num_experts; ++e) {
-            float logit = read_logit(t * num_experts + e);
-            float s = 1.0f / (1.0f + std::exp(-logit));
-            sig[e] = s;
-            choice[e] = {s + bias[e], e};
+            logit_t[e] = read_logit(t * num_experts + e);
+            if (logit_t[e] > maxv) {
+                maxv = logit_t[e];
+            }
+        }
+        float denom = 0.0f;
+        for (size_t e = 0; e < num_experts; ++e) {
+            prob[e] = std::exp(logit_t[e] - maxv);
+            denom += prob[e];
+        }
+        for (size_t e = 0; e < num_experts; ++e) {
+            prob[e] /= denom;
+            // Bias affects selection only (aux-free load balancing).
+            choice[e] = {prob[e] + bias[e], e};
         }
         std::partial_sort(
             choice.begin(), choice.begin() + moe_k_, choice.end(),
             [](const std::pair<float, size_t> &a, const std::pair<float, size_t> &b) {
                 return a.first > b.first;
             });
-        float sum = 0.0f;
+        // Combine weights are the raw softmax probabilities at the selected
+        // experts (bias excluded); HF does not renormalize them.
         for (size_t k = 0; k < moe_k_; ++k) {
             size_t e = choice[k].second;
             ic[t * moe_k_ + k] = static_cast<int32_t>(e);
-            sc[t * moe_k_ + k] = sig[e];
-            sum += sig[e];
-        }
-        if (norm_topk_prob_ && sum > 0.0f) {
-            for (size_t k = 0; k < moe_k_; ++k) {
-                sc[t * moe_k_ + k] /= sum;
-            }
+            sc[t * moe_k_ + k] = prob[e];
         }
     }
 
@@ -227,9 +236,11 @@ infinicore::Tensor Ernie4_5_VLMoeSparseMoeBlock::forward(const infinicore::Tenso
     size_t hidden = shape[2];
     size_t ntoken = shape[0] * shape[1];
     auto flat = hidden_states->view({ntoken, hidden});
+    ernie_dbg_stats("moe.input", flat);
 
     // 1) Shared experts: every token passes through (residual contribution).
     auto shared_out = shared_experts_->forward(flat);
+    ernie_dbg_stats("moe.shared", shared_out);
 
     // Output starts as shared_out; routed expert outputs are added on top.
     auto final_states = infinicore::Tensor::empty(flat->shape(), flat->dtype(), flat->device());
@@ -275,6 +286,7 @@ infinicore::Tensor Ernie4_5_VLMoeSparseMoeBlock::forward(const infinicore::Tenso
         const auto *w_ptr = reinterpret_cast<const float *>(w_cpu->data());
         const auto *i_ptr = reinterpret_cast<const int32_t *>(i_cpu->data());
 
+        static const bool dbg = (std::getenv("ERNIE_DBG") != nullptr);
         for (size_t i = 0; i < n; ++i) {
             auto token = gathered->narrow({{0, i, 1}});  // [1, hidden]
             infinicore::Tensor expert_sum;
@@ -284,11 +296,22 @@ infinicore::Tensor Ernie4_5_VLMoeSparseMoeBlock::forward(const infinicore::Tenso
                 ASSERT(global_idx < experts_->experts.size());
                 experts_->experts[global_idx]->set_alpha(w_ptr[i * moe_k_ + k]);
                 auto out = experts_->experts[global_idx]->forward(token);
+                if (dbg && i == 0) {
+                    ernie_dbg_stats(("moe.tok0.expert" + std::to_string(local_idx)).c_str(), out);
+                }
                 if (k == 0) {
                     expert_sum = out;
                 } else {
                     infinicore::op::add_(expert_sum, expert_sum, out);
                 }
+            }
+            if (dbg && i == 0) {
+                std::fprintf(stderr, "[ERNIE_DBG] moe.tok0 mod=%zu experts=", modality);
+                for (size_t k = 0; k < moe_k_; ++k) std::fprintf(stderr, "%d ", i_ptr[k]);
+                std::fprintf(stderr, "weights=");
+                for (size_t k = 0; k < moe_k_; ++k) std::fprintf(stderr, "%.4f ", w_ptr[k]);
+                std::fprintf(stderr, "\n");
+                std::fflush(stderr);
             }
             auto target = final_states->narrow({{0, idxs[i], 1}});
             infinicore::op::add_(target, target, expert_sum);
