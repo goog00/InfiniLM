@@ -642,12 +642,8 @@ def _remap_ernie4_5_vl(state_dict, config=None):
         
         result[new_key] = tensor
 
-    # after_norm in ERNIE-4.5-VL resampler is LayerNorm without bias in the checkpoint.
-    # infinicore::nn::LayerNorm requires bias -> synthesize a zeros bias so loading
-    # succeeds. Mathematically equivalent to nn.LayerNorm(bias=False).
-    after_norm_w = result.get("visual.merger.after_norm.weight")
-    if after_norm_w is not None and "visual.merger.after_norm.bias" not in result:
-        result["visual.merger.after_norm.bias"] = torch.zeros_like(after_norm_w)
+    # after_norm in the ERNIE-4.5-VL resampler is an RMSNorm (weight-only) in the
+    # checkpoint -- it maps directly to infinicore::nn::RMSNorm, no bias needed.
 
     return result
 

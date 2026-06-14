@@ -4,6 +4,7 @@
 #include "infinicore/nn/layer_norm.hpp"
 #include "infinicore/nn/linear.hpp"
 #include "infinicore/nn/module.hpp"
+#include "infinicore/nn/rmsnorm.hpp"
 #include "infinicore/tensor.hpp"
 
 #include <memory>
@@ -22,7 +23,7 @@ namespace infinilm::models::ernie4_5_moe_vl {
 //   spatial_linear  : Sequential([0]Linear(5120,5120) -> [1]act -> [2]Linear(5120,5120) -> [3]LayerNorm(5120))
 //   temporal_linear : Sequential([0]Linear(10240,5120) -> [1]act -> [2]Linear(5120,5120) -> [3]LayerNorm(5120))
 //   mlp             : Linear(5120, 2560)
-//   after_norm      : LayerNorm(2560), weight-only (no bias in checkpoint)
+//   after_norm      : RMSNorm(2560), weight-only (HF uses RMSNorm here, not LayerNorm)
 class Ernie4_5_VLResampler : public infinicore::nn::Module {
 public:
     Ernie4_5_VLResampler(std::shared_ptr<infinilm::config::ModelConfig> model_config,
@@ -51,7 +52,7 @@ protected:
     std::shared_ptr<infinicore::nn::LayerNorm> temporal_linear_3_;
 
     INFINICORE_NN_MODULE(infinicore::nn::Linear, mlp);
-    INFINICORE_NN_MODULE(infinicore::nn::LayerNorm, after_norm);
+    INFINICORE_NN_MODULE(infinicore::nn::RMSNorm, after_norm);
 };
 
 } // namespace infinilm::models::ernie4_5_moe_vl

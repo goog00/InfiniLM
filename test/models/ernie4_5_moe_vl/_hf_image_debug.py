@@ -126,6 +126,10 @@ def main():
     if vm is not None:
         dump_source("vision_model.forward", type(vm).forward)
         print("[HFDBG] vision_model children:", [n for n, _ in vm.named_children()])
+        for m in ("rot_pos_emb",):
+            mo = getattr(vm, m, None)
+            if mo is not None:
+                dump_source(f"vision_model.{m}", mo)
         vblocks = getattr(vm, "blocks", None) or getattr(vm, "layers", None)
         if vblocks is not None and len(vblocks) > 0:
             dump_source("vision_block.forward", type(vblocks[0]).forward)
@@ -143,7 +147,14 @@ def main():
     rsm = getattr(model, "resampler_model", None) or getattr(backbone, "resampler_model", None)
     if rsm is not None:
         dump_source("resampler_model.forward", type(rsm).forward)
+        for m in ("spatial_conv_reshape",):
+            mo = getattr(rsm, m, None)
+            if mo is not None:
+                dump_source(f"resampler.{m}", mo)
         print("[HFDBG] resampler children:", [n for n, _ in rsm.named_children()])
+        an = getattr(rsm, "after_norm", None)
+        if an is not None:
+            print("[HFDBG] after_norm eps:", getattr(an, "eps", getattr(an, "variance_epsilon", None)))
         for sub in ("spatial_linear", "temporal_linear", "mlp", "after_norm"):
             so = getattr(rsm, sub, None)
             if so is not None:
