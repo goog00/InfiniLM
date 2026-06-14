@@ -19,7 +19,8 @@ Ernie4_5_VLResampler::Ernie4_5_VLResampler(std::shared_ptr<infinilm::config::Mod
 
     size_t spatial_dim = pixel_hidden_size_ * spatial_conv_size_ * spatial_conv_size_;  // 5120
     size_t temporal_dim = spatial_dim * temporal_conv_size_;                            // 10240
-    double layer_norm_eps = 1e-6;
+    double layer_norm_eps = 1e-6;   // spatial/temporal Sequential LayerNorms
+    double after_norm_eps = 1e-5;   // HF after_norm RMSNorm uses eps=1e-5
 
     // spatial_linear: Linear(5120,5120) -> act -> Linear(5120,5120) -> LayerNorm(5120)
     spatial_linear_0_ = this->register_module<infinicore::nn::Linear>(
@@ -38,7 +39,7 @@ Ernie4_5_VLResampler::Ernie4_5_VLResampler(std::shared_ptr<infinilm::config::Mod
         "temporal_linear.3", spatial_dim, layer_norm_eps, dtype, device);
 
     INFINICORE_NN_MODULE_INIT(mlp, spatial_dim, text_hidden_size_, true, dtype, device);
-    INFINICORE_NN_MODULE_INIT(after_norm, text_hidden_size_, layer_norm_eps, dtype, device);
+    INFINICORE_NN_MODULE_INIT(after_norm, text_hidden_size_, after_norm_eps, dtype, device);
 }
 
 infinicore::Tensor Ernie4_5_VLResampler::forward(const infinicore::Tensor &x,
