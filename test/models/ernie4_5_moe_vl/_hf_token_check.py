@@ -60,15 +60,24 @@ def main():
         inputs["attention_mask"] = torch.ones((1, S + G), dtype=inputs["attention_mask"].dtype)
 
     # Extend 3D position_ids: generated text tokens continue all 3 axes from max+1.
+    # The processor returns [batch, seq, 3] (3 = time/height/width per token); also
+    # tolerate the transposed [3, seq] layout.
     pos = inputs["position_ids"]
+    bdims = pos.dim() - 2
     p = pos
-    while p.dim() > 2:
-        p = p[0]            # strip leading batch dim -> [3, S]
-    assert tuple(p.shape) == (3, S), f"unexpected position_ids shape {tuple(p.shape)}"
+    for _ in range(bdims):
+        p = p[0]            # strip leading batch dim(s) -> 2D
     maxp = int(p.max().item())
-    ext = torch.arange(maxp + 1, maxp + 1 + G).view(1, G).repeat(3, 1).to(p.dtype)  # [3, G]
-    p_full = torch.cat([p, ext], dim=1)                                            # [3, S+G]
-    inputs["position_ids"] = p_full.view(1, 3, S + G) if pos.dim() > 2 else p_full
+    if tuple(p.shape) == (S, 3):          # [seq, axes]
+        ext = torch.arange(maxp + 1, maxp + 1 + G).view(G, 1).repeat(1, 3).to(p.dtype)
+        p_full = torch.cat([p, ext], dim=0)              # [S+G, 3]
+        inputs["position_ids"] = p_full.view(*([1] * bdims), S + G, 3)
+    elif tuple(p.shape) == (3, S):        # [axes, seq]
+        ext = torch.arange(maxp + 1, maxp + 1 + G).view(1, G).repeat(3, 1).to(p.dtype)
+        p_full = torch.cat([p, ext], dim=1)              # [3, S+G]
+        inputs["position_ids"] = p_full.view(*([1] * bdims), 3, S + G)
+    else:
+        raise AssertionError(f"unexpected position_ids shape {tuple(pos.shape)}")
     print(f"[CHK] prompt max pos={maxp}; gen positions {maxp + 1}..{maxp + G} (3 axes equal)")
 
     # token_type_ids: gen tokens are text(0); the model wants len == seq + 1.
