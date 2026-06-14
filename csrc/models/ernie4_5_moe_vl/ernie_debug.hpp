@@ -17,11 +17,12 @@
 namespace infinilm::models::ernie4_5_moe_vl {
 
 // Only rank 0 prints, otherwise TP=2 interleaves both ranks' stderr and the
-// output is unreadable (lines split/duplicated mid-token).
+// output is unreadable (lines split/duplicated mid-token). Cache only the env
+// check; query the rank live -- caching it can latch the value from before the
+// TP rank is assigned (during module construction), suppressing all output.
 inline bool ernie_dbg_enabled() {
-    static const bool on = (std::getenv("ERNIE_DBG") != nullptr)
-                        && (infinilm::global_state::get_tensor_model_parallel_rank() == 0);
-    return on;
+    static const bool env_on = (std::getenv("ERNIE_DBG") != nullptr);
+    return env_on && (infinilm::global_state::get_tensor_model_parallel_rank() == 0);
 }
 
 inline void ernie_dbg_stats(const char *tag, const infinicore::Tensor &t) {
