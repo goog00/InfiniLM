@@ -138,6 +138,17 @@ def main():
                 dump_source(f"vision.{rn}", type(ro).forward if hasattr(type(ro), "forward") else ro)
                 break
 
+    # Resampler/merger source (verify our Ernie4_5_VLResampler; note HF ran
+    # temporal_linear even for a single image t=1 -- check how).
+    rsm = getattr(model, "resampler_model", None)
+    if rsm is not None:
+        dump_source("resampler_model.forward", type(rsm).forward)
+        print("[HFDBG] resampler children:", [n for n, _ in rsm.named_children()])
+        for sub in ("spatial_linear", "temporal_linear", "mlp", "after_norm"):
+            so = getattr(rsm, sub, None)
+            if so is not None:
+                print(f"[HFDBG] resampler.{sub} = {so}")
+
     inputs = {k: (v.to(model.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
 
     # The model asserts token_type_ids length == seq+1 (it shifts internally for the
