@@ -43,22 +43,22 @@ infinicore::Tensor Ernie4_5_VLMoeForConditionalGeneration::derive_token_type_ids
     // token inside an image/video span.
     auto ids_cpu = input_ids->to(infinicore::Device::cpu());
     auto shape = ids_cpu->shape();
-    auto token_type = infinicore::Tensor::zeros(shape, infinicore::DataType::I64, infinicore::Device::cpu());
-
-    const auto *ids = reinterpret_cast<const int64_t *>(ids_cpu->data());
-    auto *tt = reinterpret_cast<int64_t *>(token_type->data());
     size_t numel = ids_cpu->numel();
+    const auto *ids = reinterpret_cast<const int64_t *>(ids_cpu->data());
+
+    // Build on CPU and write EVERY element explicitly. Tensor::zeros(I64) is not
+    // reliable here (it does not actually clear the buffer), so a zeros-then-set-1
+    // construction leaves the text (0) entries full of garbage, which randomly
+    // misclassifies text tokens as vision and routes them through the wrong expert
+    // set -> non-deterministic output. Allocate with empty() and assign all slots.
+    // Keep the result on CPU: the MoE dispatch is the only consumer and reads it on
+    // the host; round-tripping this I64 tensor through MetaX device memory is both
+    // wasteful and an additional corruption risk.
+    auto token_type = infinicore::Tensor::empty(shape, infinicore::DataType::I64, infinicore::Device::cpu());
+    auto *tt = reinterpret_cast<int64_t *>(token_type->data());
     for (size_t i = 0; i < numel; ++i) {
-        if (ids[i] == im_patch_id_) {
-            tt[i] = 1;
-        }
+        tt[i] = (ids[i] == im_patch_id_) ? 1 : 0;
     }
-    // Keep token_type on CPU: the MoE dispatch is the only consumer and it reads
-    // these values on the host (Tensor::to(cpu) then raw pointer). Round-tripping
-    // this I64 tensor through MetaX device memory is wasteful and unreliable --
-    // device I64 transfers can drop/corrupt elements, randomly flipping a token's
-    // text/vision classification and routing it through the wrong expert set,
-    // which manifests as non-deterministic output across runs.
     return token_type;
 }
 
