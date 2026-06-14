@@ -112,11 +112,14 @@ def main():
     model.eval()
     backbone = model.model if hasattr(model, "model") else model
 
-    # vision_forward source (verify our vision tower port).
+    # vision_forward + conditional-generation forward source (resampler + scatter
+    # live in the latter); verify our vision tower + merger port.
     for meth in ("vision_forward",):
         obj = getattr(model, meth, None)
         if obj is not None:
             dump_source(f"model.{meth}", obj)
+    dump_source("type(model).forward", type(model).forward)
+    print("[HFDBG] model children:", [n for n, _ in model.named_children()])
 
     inputs = {k: (v.to(model.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
 
@@ -164,6 +167,16 @@ def main():
             vis.register_forward_hook(mk_hook("vision_model_raw"))
             print(f"[HFDBG] hooked raw ViT module: {vname}")
             break
+    # patch_embed (compare our vis.patch_embed [1024,1280]) + any resampler/merger.
+    for name, mod in model.named_modules():
+        low = name.lower()
+        if low.endswith("patch_embed"):
+            mod.register_forward_hook(mk_hook("patch_embed"))
+            print(f"[HFDBG] hooked patch_embed: {name}")
+        if any(k in low for k in ("resampler", "merger", "mlp_ar", "variable_resolution")) \
+                and low.count(".") <= 2:
+            mod.register_forward_hook(mk_hook("resampler:" + name))
+            print(f"[HFDBG] hooked resampler candidate: {name}")
     if layers is not None:
         layers[0].register_forward_hook(mk_hook("L0"))
         if nlayer > 1:
@@ -180,9 +193,14 @@ def main():
         print(f"[HFDBG] forward failed: {e}")
 
     # vision runs before the backbone, so these are captured even if the backbone
-    # crashes. vision_forward_out is the post-merge [256,2560] == our vl.vision_embeds.
+    # crashes. vision_model_raw/vision_forward_out are [1024,1280] (pre-merge ViT);
+    # resampler:* outputs are post-merge [256,2560] == our vl.vision_embeds.
+    stats("patch_embed", captures.get("patch_embed"))
     stats("vision_model_raw", captures.get("vision_model_raw"))
     stats("vision_forward_out", captures.get("vision_forward_out"))
+    for key in sorted(captures):
+        if key.startswith("resampler:"):
+            stats(key, captures[key])
     stats("L0 stream", captures.get("L0"))
     stats("L1 stream", captures.get("L1"))
     if logits is not None:

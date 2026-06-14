@@ -1,6 +1,7 @@
 #include "ernie4_5_moe_vl_vision.hpp"
 
 #include "../../utils.hpp"
+#include "ernie_debug.hpp"
 #include "infinicore/ops.hpp"
 
 #include <cmath>
@@ -308,6 +309,7 @@ infinicore::Tensor Ernie4_5_VisionTransformer::forward(const infinicore::Tensor 
     auto patch_out = patch_embed_->forward(pixel_values);
     ASSERT(patch_out->ndim() == 2);
     auto hidden = patch_out;
+    ernie_dbg_stats("vis.patch_embed", hidden);
 
     // 2. 2D-rope tables + per-frame attention segments from the patch grid.
     auto [sin_tbl, cos_tbl, pos_index] = build_rope_(grid_thw, hidden->dtype(), hidden->device());
@@ -316,9 +318,11 @@ infinicore::Tensor Ernie4_5_VisionTransformer::forward(const infinicore::Tensor 
     for (const auto &block : blocks_) {
         hidden = block->forward(hidden, sin_tbl, cos_tbl, pos_index, cu_seqlens);
     }
+    ernie_dbg_stats("vis.post_blocks", hidden);
 
     // 3. Post-transformer LayerNorm (visual.norm1).
     hidden = norm1_->forward(hidden);
+    ernie_dbg_stats("vis.post_norm1", hidden);
 
     // 4. Spatial+temporal merge and projection -> [num_merged_tokens, text_hidden_size].
     return merger_->forward(hidden, grid_thw);
