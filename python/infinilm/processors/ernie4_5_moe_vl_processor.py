@@ -344,6 +344,16 @@ class Ernie4_5_VLMoeProcessor(BasicLLMProcessor):
             pos_slice = [[row[pos]] for row in pos3d]
 
         base["position_ids"] = infinicore.from_list(pos_slice, dtype=infinicore.int64)
+
+        import os as _os
+        if _os.environ.get("ERNIE_DBG"):
+            import sys as _sys
+            _ip = getattr(scheduler_output, "is_prefill", True)
+            _tail = [r[-4:] for r in pos_slice]
+            print(f"[ERNIE_DBG.py] is_prefill={_ip} npos={len(pos_slice[0])} "
+                  f"total_len={req.get_total_length()} n_tokens={len(req.get_all_token_ids())} "
+                  f"pos_tail={_tail}", file=_sys.stderr, flush=True)
+
         return base
 
     def _infini_dtype(self):
