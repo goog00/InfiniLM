@@ -56,8 +56,20 @@ infinicore::Tensor Ernie4_5_VLMoeForConditionalGeneration::derive_token_type_ids
     // wasteful and an additional corruption risk.
     auto token_type = infinicore::Tensor::empty(shape, infinicore::DataType::I64, infinicore::Device::cpu());
     auto *tt = reinterpret_cast<int64_t *>(token_type->data());
+    // HF marks the entire contiguous span [START .. END] -- including the
+    // IMAGE/VIDEO_START and _END marker tokens, not just the inner placeholders --
+    // as the vision modality (token_type=1). Routing the markers through text
+    // experts (placeholder-only classification) perturbs the MoE output and diverges
+    // from HF. Track the span and mark start/end inclusive.
+    bool in_vision = false;
     for (size_t i = 0; i < numel; ++i) {
-        tt[i] = (ids[i] == im_patch_id_) ? 1 : 0;
+        if (ids[i] == image_start_token_id_ || ids[i] == video_start_token_id_) {
+            in_vision = true;
+        }
+        tt[i] = (in_vision || ids[i] == im_patch_id_) ? 1 : 0;
+        if (ids[i] == image_end_token_id_ || ids[i] == video_end_token_id_) {
+            in_vision = false;
+        }
     }
     return token_type;
 }
