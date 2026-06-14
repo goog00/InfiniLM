@@ -53,87 +53,72 @@ def main():
     print("[HFDBG] processor public attrs:", [m for m in dir(processor) if not m.startswith("_")])
     print("[HFDBG] tokenizer.chat_template present:", bool(getattr(tokenizer, "chat_template", None)))
 
-    # (A) Dump processor + tokenizer entry points so we know the API + can verify our port.
-    dump_source("processor.__call__", type(processor).__call__)
-    for meth in ("apply_chat_template", "process", "preprocess", "_add_special_tokens"):
+    # Position-id logic lives in the processor (it returns position_ids directly).
+    for meth in ("_add_image", "_add_text", "_pack_outputs", "_add_video"):
         obj = getattr(processor, meth, None)
         if obj is not None:
             dump_source(f"processor.{meth}", obj)
+    ip = getattr(processor, "image_processor", None)
+    if ip is not None:
+        print("[HFDBG] image_processor:", type(ip).__name__,
+              "mean=", getattr(ip, "image_mean", None),
+              "std=", getattr(ip, "image_std", None),
+              "rescale=", getattr(ip, "rescale_factor", None))
+
+    # (B) Build inputs via processor(text=rendered, images=[img]).
+    img = Image.open(args.image).convert("RGB")
+    conv = [{"role": "user", "content": [
+        {"type": "image"}, {"type": "text", "text": args.text}]}]
+    rendered = tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=True)
+    print(f"[HFDBG] rendered prompt = {rendered!r}")
+    inputs = processor(text=rendered, images=[img], return_tensors="pt")
+    print(f"[HFDBG] inputs keys={list(inputs.keys())}")
+
+    ids = inputs["input_ids"][0].tolist()
+    print(f"[HFDBG] input_ids ({len(ids)}): {ids}")
+    if "grid_thw" in inputs:
+        print(f"[HFDBG] grid_thw = {inputs['grid_thw'].tolist()}")
+    # Position ids + token_type ids: ground truth for our processor.
+    for key in ("position_ids", "token_type_ids", "image_type_ids"):
+        if key in inputs and inputs[key] is not None:
+            t = inputs[key]
+            sq = t
+            while hasattr(sq, "dim") and sq.dim() > 2 and sq.shape[0] == 1:
+                sq = sq[0]
+            print(f"[HFDBG] {key} shape={tuple(t.shape)} ->")
+            if key == "position_ids" and hasattr(sq, "dim") and sq.dim() == 2 and sq.shape[0] == 3:
+                for ax, nm in enumerate(("time", "height", "width")):
+                    print(f"[HFDBG]   pos.{nm}: {sq[ax].tolist()}")
+            else:
+                print(f"[HFDBG]   {sq.tolist()}")
+    if "images" in inputs and hasattr(inputs["images"], "shape"):
+        stats("in.images(raw)", inputs["images"])
+
+    # Normalize images: processor returns uint8 [N, C*p*p] (channel-major), but
+    # vision_forward asserts bf16 normalized. Match our processor (CLIP mean/std).
+    imgs = inputs["images"]
+    if imgs.dtype == torch.uint8 or imgs.float().max() > 10:
+        mean = torch.tensor(getattr(ip, "image_mean", [0.48145466, 0.4578275, 0.40821073]))
+        std = torch.tensor(getattr(ip, "image_std", [0.26862954, 0.26130258, 0.27577711]))
+        resc = float(getattr(ip, "rescale_factor", 1.0 / 255.0))
+        N = imgs.shape[0]
+        x = imgs.float().view(N, 3, -1)
+        x = (x * resc - mean.view(1, 3, 1)) / std.view(1, 3, 1)
+        inputs["images"] = x.view(N, -1).to(torch.bfloat16)
+        stats("in.images(norm)", inputs["images"])
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model, dtype=torch.bfloat16, device_map="auto", trust_remote_code=True)
     model.eval()
     backbone = model.model if hasattr(model, "model") else model
 
-    # get_rope_index + rope source (verify _build_3d_position_ids + build_mrope_).
-    for owner_name, owner in (("model", model), ("backbone", backbone)):
-        if hasattr(owner, "get_rope_index"):
-            dump_source(f"{owner_name}.get_rope_index", owner.get_rope_index)
-            break
-
-    # (B) Build inputs. processor has no chat template; render via tokenizer then
-    # feed text+image to the processor. Try the common transformers patterns.
-    img = Image.open(args.image).convert("RGB")
-    rendered = None
-    try:
-        conv = [{"role": "user", "content": [
-            {"type": "image"}, {"type": "text", "text": args.text}]}]
-        rendered = tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=True)
-    except Exception as e:  # noqa: BLE001
-        print(f"[HFDBG] tokenizer.apply_chat_template(list) failed: {e}")
-        rendered = f"User: {args.text}\nAssistant:"
-    print(f"[HFDBG] rendered prompt = {rendered!r}")
-
-    inputs = None
-    for desc, fn in (
-        ("processor(text=,images=)", lambda: processor(text=rendered, images=[img], return_tensors="pt")),
-        ("processor(text=,images=img)", lambda: processor(text=rendered, images=img, return_tensors="pt")),
-        ("processor(rendered,[img])", lambda: processor(rendered, [img], return_tensors="pt")),
-        ("processor(images=,text=list)", lambda: processor(text=[rendered], images=[img], return_tensors="pt")),
-    ):
-        try:
-            inputs = fn()
-            print(f"[HFDBG] inputs built via {desc}; keys={list(inputs.keys())}")
-            break
-        except Exception as e:  # noqa: BLE001
-            print(f"[HFDBG] {desc} failed: {e}")
-    if inputs is None:
-        print("[HFDBG] could not build processor inputs; see source dumps above. Aborting forward.")
-        return
-
-    ids = inputs["input_ids"][0].tolist()
-    print(f"[HFDBG] input_ids ({len(ids)}): {ids}")
-    for k in ("grid_thw", "image_grid_thw", "tgt_sizes"):
-        if k in inputs:
-            print(f"[HFDBG] {k} = {inputs[k].tolist() if hasattr(inputs[k], 'tolist') else inputs[k]}")
-    for k in ("pixel_values", "images", "pixel_values_images"):
-        if k in inputs and inputs[k] is not None and hasattr(inputs[k], "shape"):
-            stats(f"in.{k}", inputs[k])
+    # vision_forward source (verify our vision tower port).
+    for meth in ("vision_forward",):
+        obj = getattr(model, meth, None)
+        if obj is not None:
+            dump_source(f"model.{meth}", obj)
 
     inputs = {k: (v.to(model.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
-
-    # Call HF get_rope_index to diff against our _build_3d_position_ids.
-    try:
-        owner = model if hasattr(model, "get_rope_index") else backbone
-        sig = inspect.signature(owner.get_rope_index)
-        kw = {}
-        if "input_ids" in sig.parameters:
-            kw["input_ids"] = inputs["input_ids"]
-        for gk in ("image_grid_thw", "grid_thw"):
-            if gk in sig.parameters and gk in inputs:
-                kw[gk] = inputs[gk]
-        if "attention_mask" in sig.parameters and "attention_mask" in inputs:
-            kw["attention_mask"] = inputs["attention_mask"]
-        res = owner.get_rope_index(**kw)
-        pos = res[0] if isinstance(res, tuple) else res
-        p = pos.detach().cpu()
-        if p.dim() == 3:  # [3, bs, seq] -> [3, seq]
-            p = p[:, 0, :]
-        print(f"[HFDBG] get_rope_index pos shape={tuple(pos.shape)}")
-        for ax, nm in enumerate(("time", "height", "width")):
-            print(f"[HFDBG] pos.{nm}: {p[ax].tolist()}")
-    except Exception as e:  # noqa: BLE001
-        print(f"[HFDBG] get_rope_index call failed: {e}")
 
     # Bypass SDPA like the text path.
     layers = getattr(backbone, "layers", None)
@@ -163,24 +148,25 @@ def main():
         if nlayer > 1:
             layers[1].register_forward_hook(mk_hook("L1"))
 
+    # Plain single forward (no generate -> avoids the remote code's legacy-cache
+    # past_key_values[0][0] assumption). use_cache=False keeps it a pure prefill.
+    logits = None
     try:
         with torch.no_grad():
-            gen = model.generate(
-                **inputs, max_new_tokens=1, do_sample=False, num_beams=1,
-                return_dict_in_generate=True, output_scores=True)
-        logits = gen.scores[0][0].float().cpu()
-    except Exception as e:  # noqa: BLE001
-        print(f"[HFDBG] generate failed ({e}); trying plain forward")
-        with torch.no_grad():
-            out = model(**inputs)
+            out = model(**inputs, use_cache=False)
         logits = out.logits[0, -1].float().cpu()
+    except Exception as e:  # noqa: BLE001
+        print(f"[HFDBG] forward failed: {e}")
 
+    # vision hook fires before the backbone, so it is captured even if the
+    # backbone crashes -- still useful to compare the vision tower.
     stats("vision", captures.get("vision"))
     stats("L0 stream", captures.get("L0"))
     stats("L1 stream", captures.get("L1"))
-    top = torch.topk(logits, 5)
-    print("[HFDBG] logits min={:.3f} max={:.3f}".format(logits.min(), logits.max()))
-    print("[HFDBG] top5:", [(int(i), round(float(v), 3)) for v, i in zip(top.values, top.indices)])
+    if logits is not None:
+        top = torch.topk(logits, 5)
+        print("[HFDBG] logits min={:.3f} max={:.3f}".format(logits.min(), logits.max()))
+        print("[HFDBG] top5:", [(int(i), round(float(v), 3)) for v, i in zip(top.values, top.indices)])
 
 
 if __name__ == "__main__":
