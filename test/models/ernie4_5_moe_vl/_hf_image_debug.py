@@ -138,10 +138,28 @@ def main():
             g = getattr(moe, "gate", None)
             if g is not None:
                 dump_source("moe_gate.forward", type(g).forward)
-                for gp in ("weight", "weight_1"):
+                for gm in ("get_gate_weight", "_cal_gate_logits_and_dispatch",
+                           "topk_gating", "top1_gating", "gating", "_priority"):
+                    gmo = getattr(g, gm, None)
+                    if gmo is not None and callable(gmo):
+                        dump_source(f"moe_gate.{gm}", gmo)
+                for gp in ("weight", "weight_1", "bias"):
                     gw = getattr(g, gp, None)
                     if gw is not None and hasattr(gw, "shape"):
                         print(f"[HFDBG] moe.gate.{gp} shape={tuple(gw.shape)}")
+                print("[HFDBG] gate flags:",
+                      {k: getattr(g, k, None) for k in
+                       ("use_token_type_bias", "norm_min", "moe_k", "top_k",
+                        "num_experts", "num_experts_tensor", "config_topk", "use_correction_bias")})
+            for dm in ("fused_gate_and_dispatch", "forward_experts", "gate_distribution"):
+                dmo = getattr(moe, dm, None)
+                if dmo is not None and callable(dmo):
+                    dump_source(f"moe.{dm}", dmo)
+            ms = getattr(moe, "moe_statics", None)
+            if ms is not None:
+                eb = getattr(ms, "e_score_correction_bias", None)
+                if eb is not None and hasattr(eb, "shape"):
+                    print(f"[HFDBG] moe_statics.e_score_correction_bias shape={tuple(eb.shape)}")
             se = getattr(moe, "shared_experts", None)
             if se is not None:
                 print(f"[HFDBG] shared_experts: {se}")
