@@ -120,6 +120,34 @@ def main():
 
     inputs = {k: (v.to(model.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
 
+    # The model asserts token_type_ids length == seq+1 (it shifts internally for the
+    # next-token slot). Pad one text(0) column at the end.
+    tt = inputs.get("token_type_ids")
+    if tt is not None and tt.shape[1] == inputs["input_ids"].shape[1]:
+        pad = torch.zeros((tt.shape[0], 1), dtype=tt.dtype, device=tt.device)
+        inputs["token_type_ids"] = torch.cat([tt, pad], dim=1)
+        print(f"[HFDBG] padded token_type_ids -> {tuple(inputs['token_type_ids'].shape)}")
+
+    captures = {}
+
+    def mk_hook(name):
+        def hook(_m, _i, o):
+            captures[name] = o[0] if isinstance(o, tuple) else o
+        return hook
+
+    # Capture the POST-merge vision embeddings (vision_forward return), which is
+    # what gets scattered into the text sequence == our vl.vision_embeds [256,2560].
+    if hasattr(model, "vision_forward"):
+        _orig_vf = model.vision_forward
+
+        def _vf_wrap(*a, **k):
+            r = _orig_vf(*a, **k)
+            captures["vision_forward_out"] = r[0] if isinstance(r, tuple) else r
+            return r
+
+        model.vision_forward = _vf_wrap
+        print("[HFDBG] wrapped vision_forward")
+
     # Bypass SDPA like the text path.
     layers = getattr(backbone, "layers", None)
     nlayer = len(layers) if layers is not None else 0
@@ -130,18 +158,11 @@ def main():
                 attn.attn_func = attn.core_attn
         print(f"[HFDBG] patched core_attn on {nlayer} layers")
 
-    captures = {}
-
-    def mk_hook(name):
-        def hook(_m, _i, o):
-            captures[name] = o[0] if isinstance(o, tuple) else o
-        return hook
-
     for vname in ("visual", "vision_model", "vision_tower"):
         vis = getattr(model, vname, None) or getattr(backbone, vname, None)
         if vis is not None:
-            vis.register_forward_hook(mk_hook("vision"))
-            print(f"[HFDBG] hooked vision module: {vname}")
+            vis.register_forward_hook(mk_hook("vision_model_raw"))
+            print(f"[HFDBG] hooked raw ViT module: {vname}")
             break
     if layers is not None:
         layers[0].register_forward_hook(mk_hook("L0"))
@@ -158,9 +179,10 @@ def main():
     except Exception as e:  # noqa: BLE001
         print(f"[HFDBG] forward failed: {e}")
 
-    # vision hook fires before the backbone, so it is captured even if the
-    # backbone crashes -- still useful to compare the vision tower.
-    stats("vision", captures.get("vision"))
+    # vision runs before the backbone, so these are captured even if the backbone
+    # crashes. vision_forward_out is the post-merge [256,2560] == our vl.vision_embeds.
+    stats("vision_model_raw", captures.get("vision_model_raw"))
+    stats("vision_forward_out", captures.get("vision_forward_out"))
     stats("L0 stream", captures.get("L0"))
     stats("L1 stream", captures.get("L1"))
     if logits is not None:
