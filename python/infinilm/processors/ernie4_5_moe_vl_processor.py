@@ -63,18 +63,22 @@ class Ernie4_5_VLMoeProcessor(BasicLLMProcessor):
         self.temporal_conv_size = cfg.get("temporal_conv_size", 2)
         self.spatial_conv_size = cfg.get("spatial_conv_size", 2)
 
-    # Literal markers kept in the rendered prompt string so __call__ can splice the
-    # exact number of patch-placeholder tokens per media item. They must not collide
-    # with real text; __call__ splits the prompt on them.
-    IMAGE_SENTINEL = "<|__ernie_vl_image__|>"
-    VIDEO_SENTINEL = "<|__ernie_vl_video__|>"
+    # Placeholder markers the tokenizer chat template emits for each media item
+    # (its render_content macro renders " Picture N:<|IMAGE_START|><|image@placeholder
+    # |><|IMAGE_END|>" / the video equivalent). __call__ splits the rendered prompt on
+    # these and splices the per-image patch-placeholder token run in their place.
+    IMAGE_SENTINEL = "<|IMAGE_START|><|image@placeholder|><|IMAGE_END|>"
+    VIDEO_SENTINEL = "<|VIDEO_START|><|video@placeholder|><|VIDEO_END|>"
 
     # ------------------------------------------------------------------
-    # Chat template: pure text defers to parent. For multimodal we render each
-    # media item to a sentinel marker (role structure still from the tokenizer
-    # template) and let __call__ replace each sentinel with image_start +
-    # im_patch * N + image_end token ids. Returns a STRING (tokenize is ignored
-    # for the multimodal path; the LLM pipeline tokenizes via __call__).
+    # Chat template: defer to the tokenizer's template for BOTH text and multimodal.
+    # The template's render_content macro turns image/video content items into the
+    # markers above (with the "Picture N:" / "Video N:" prefixes ERNIE was trained
+    # with), so we pass the conversation through unchanged -- flattening it to a
+    # custom sentinel string (the previous approach) bypassed that macro and dropped
+    # the "Picture N:" prefix, which corrupted the multimodal prompt. __call__ then
+    # expands each marker into image_start + im_patch * N + image_end token ids.
+    # tokenize=False: the LLM pipeline tokenizes via __call__.
     # ------------------------------------------------------------------
     def apply_chat_template(
         self,
@@ -91,29 +95,8 @@ class Ernie4_5_VLMoeProcessor(BasicLLMProcessor):
                 **kwargs,
             )
 
-        normalized = []
-        for message in conversation:
-            content = message.get("content")
-            if isinstance(content, list):
-                parts = []
-                for item in content:
-                    t = item.get("type", "text")
-                    if t == "text":
-                        parts.append(item.get("text", ""))
-                    elif t in ("image", "image_url"):
-                        parts.append(self.IMAGE_SENTINEL)
-                    elif t in ("video", "video_url"):
-                        parts.append(self.VIDEO_SENTINEL)
-                    else:
-                        raise ValueError(f"Unsupported content item type: {t}")
-                normalized.append({"role": message["role"], "content": "".join(parts)})
-            else:
-                normalized.append(message)
-
-        # tokenize=False: keep sentinels as literal text; __call__ re-tokenizes and
-        # splices placeholder token ids.
         return self.tokenizer.apply_chat_template(
-            conversation=normalized,
+            conversation=conversation,
             add_generation_prompt=add_generation_prompt,
             tokenize=False,
             **kwargs,
