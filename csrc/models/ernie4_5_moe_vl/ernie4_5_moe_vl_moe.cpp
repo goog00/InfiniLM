@@ -286,7 +286,7 @@ infinicore::Tensor Ernie4_5_VLMoeSparseMoeBlock::forward(const infinicore::Tenso
         const auto *w_ptr = reinterpret_cast<const float *>(w_cpu->data());
         const auto *i_ptr = reinterpret_cast<const int32_t *>(i_cpu->data());
 
-        static const bool dbg = (std::getenv("ERNIE_DBG") != nullptr);
+        static const bool dbg = ernie_dbg_enabled();
         for (size_t i = 0; i < n; ++i) {
             auto token = gathered->narrow({{0, i, 1}});  // [1, hidden]
             infinicore::Tensor expert_sum;

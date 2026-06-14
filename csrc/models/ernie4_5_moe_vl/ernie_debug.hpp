@@ -4,6 +4,7 @@
 // no-op in normal runs.
 #pragma once
 
+#include "../../global_state/global_state.hpp"
 #include "../../utils.hpp"
 #include "infinicore/ops.hpp"
 
@@ -15,9 +16,16 @@
 
 namespace infinilm::models::ernie4_5_moe_vl {
 
+// Only rank 0 prints, otherwise TP=2 interleaves both ranks' stderr and the
+// output is unreadable (lines split/duplicated mid-token).
+inline bool ernie_dbg_enabled() {
+    static const bool on = (std::getenv("ERNIE_DBG") != nullptr)
+                        && (infinilm::global_state::get_tensor_model_parallel_rank() == 0);
+    return on;
+}
+
 inline void ernie_dbg_stats(const char *tag, const infinicore::Tensor &t) {
-    static const bool on = (std::getenv("ERNIE_DBG") != nullptr);
-    if (!on) {
+    if (!ernie_dbg_enabled()) {
         return;
     }
     auto c = t->to(infinicore::Device::cpu())->contiguous();
