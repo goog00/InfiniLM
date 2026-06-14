@@ -121,6 +121,31 @@ def main():
     dump_source("type(model).forward", type(model).forward)
     print("[HFDBG] model children:", [n for n, _ in model.named_children()])
 
+    # MoE block: layer 1 is the first MoE layer; the vision-token routing
+    # (token_type=1 -> vision experts/gate) diverges there (L0 matches, L1 doesn't).
+    _bb = model.model if hasattr(model, "model") else model
+    _lys = getattr(_bb, "layers", None)
+    if _lys is not None and len(_lys) > 1:
+        moe = getattr(_lys[1], "mlp", None)
+        if moe is not None:
+            dump_source("moe_block.forward", type(moe).forward)
+            print("[HFDBG] moe children:", [n for n, _ in moe.named_children()])
+            for sub in ("gate", "experts", "shared_experts", "moe_statics"):
+                so = getattr(moe, sub, None)
+                if so is not None:
+                    n = len(so) if hasattr(so, "__len__") else ""
+                    print(f"[HFDBG] moe.{sub}: {type(so).__name__} len={n}")
+            g = getattr(moe, "gate", None)
+            if g is not None:
+                dump_source("moe_gate.forward", type(g).forward)
+                for gp in ("weight", "weight_1"):
+                    gw = getattr(g, gp, None)
+                    if gw is not None and hasattr(gw, "shape"):
+                        print(f"[HFDBG] moe.gate.{gp} shape={tuple(gw.shape)}")
+            se = getattr(moe, "shared_experts", None)
+            if se is not None:
+                print(f"[HFDBG] shared_experts: {se}")
+
     # The block divergence is inside the ViT; dump vision_model + one block + rope.
     vm = getattr(model, "vision_model", None)
     if vm is not None:
