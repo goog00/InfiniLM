@@ -2,6 +2,7 @@
 
 #include "../../global_state/global_state.hpp"
 #include "../models_registry.hpp"
+#include "ernie_debug.hpp"
 #include "infinicore/ops.hpp"
 
 #include <cstring>
@@ -96,12 +97,15 @@ InfinilmModel::Output Ernie4_5_VLMoeForConditionalGeneration::forward(const Inpu
         }
         auto pixel_values = input.pixel_values.value();
         auto grid_thw = input.tgt_sizes.value();
+        ernie_dbg_stats("vl.pixel_values", pixel_values);
 
         // visual_ forward: ViT blocks -> merger -> [num_merged_tokens, text_hidden].
         auto vision_embeds = visual_->forward(pixel_values, grid_thw);
+        ernie_dbg_stats("vl.vision_embeds", vision_embeds);
 
         auto inputs_embeds = model_->embed_tokens(input_ids);
         auto merged = merge_vision_embeddings(inputs_embeds, vision_embeds, input_ids);
+        ernie_dbg_stats("vl.merged", merged);
         auto token_type_ids = derive_token_type_ids(input_ids);
 
         auto position_ids = input.position_ids.value();
