@@ -5,6 +5,8 @@
 #include "infinicore/ops.hpp"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -83,6 +85,20 @@ Ernie4_5_VLMoeAttention::build_mrope_(const infinicore::Tensor &position_ids,
     auto pos_cpu = position_ids->to(infinicore::Device::cpu())->contiguous();
     size_t seq = pos_cpu->shape()[1];
     const auto *pp = reinterpret_cast<const int64_t *>(pos_cpu->data());
+
+    // TEMP DEBUG: dump the 3 position rows once (layer 0) to diff vs HF get_rope_index.
+    if (layer_idx_ == 0 && std::getenv("ERNIE_DBG") != nullptr
+        && infinilm::global_state::get_tensor_model_parallel_rank() == 0) {
+        const char *nm[3] = {"time", "height", "width"};
+        for (size_t ax = 0; ax < 3; ++ax) {
+            std::fprintf(stderr, "[ERNIE_DBG] pos.%s:", nm[ax]);
+            for (size_t i = 0; i < seq; ++i) {
+                std::fprintf(stderr, " %lld", static_cast<long long>(pp[ax * seq + i]));
+            }
+            std::fprintf(stderr, "\n");
+        }
+        std::fflush(stderr);
+    }
 
     size_t cache_dim = head_dim_ / 2;
 
