@@ -315,8 +315,11 @@ infinicore::Tensor Ernie4_5_VisionTransformer::forward(const infinicore::Tensor 
     auto [sin_tbl, cos_tbl, pos_index] = build_rope_(grid_thw, hidden->dtype(), hidden->device());
     auto cu_seqlens = build_cu_seqlens_(grid_thw);
 
-    for (const auto &block : blocks_) {
-        hidden = block->forward(hidden, sin_tbl, cos_tbl, pos_index, cu_seqlens);
+    for (size_t bi = 0; bi < blocks_.size(); ++bi) {
+        hidden = blocks_[bi]->forward(hidden, sin_tbl, cos_tbl, pos_index, cu_seqlens);
+        if (bi == 0) {
+            ernie_dbg_stats("vis.block0", hidden);
+        }
     }
     ernie_dbg_stats("vis.post_blocks", hidden);
 

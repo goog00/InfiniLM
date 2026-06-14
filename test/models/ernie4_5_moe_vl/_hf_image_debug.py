@@ -121,6 +121,23 @@ def main():
     dump_source("type(model).forward", type(model).forward)
     print("[HFDBG] model children:", [n for n, _ in model.named_children()])
 
+    # The block divergence is inside the ViT; dump vision_model + one block + rope.
+    vm = getattr(model, "vision_model", None)
+    if vm is not None:
+        dump_source("vision_model.forward", type(vm).forward)
+        print("[HFDBG] vision_model children:", [n for n, _ in vm.named_children()])
+        vblocks = getattr(vm, "blocks", None) or getattr(vm, "layers", None)
+        if vblocks is not None and len(vblocks) > 0:
+            dump_source("vision_block.forward", type(vblocks[0]).forward)
+            attn0 = getattr(vblocks[0], "attn", None) or getattr(vblocks[0], "attention", None)
+            if attn0 is not None:
+                dump_source("vision_attn.forward", type(attn0).forward)
+        for rn in ("rotary_pos_emb", "rot_pos_emb", "rope", "rotary_emb"):
+            ro = getattr(vm, rn, None)
+            if ro is not None:
+                dump_source(f"vision.{rn}", type(ro).forward if hasattr(type(ro), "forward") else ro)
+                break
+
     inputs = {k: (v.to(model.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
 
     # The model asserts token_type_ids length == seq+1 (it shifts internally for the
@@ -168,6 +185,7 @@ def main():
             print(f"[HFDBG] hooked raw ViT module: {vname}")
             break
     # patch_embed (compare our vis.patch_embed [1024,1280]) + any resampler/merger.
+    import re
     for name, mod in model.named_modules():
         low = name.lower()
         if low.endswith("patch_embed"):
@@ -177,6 +195,13 @@ def main():
                 and low.count(".") <= 2:
             mod.register_forward_hook(mk_hook("resampler:" + name))
             print(f"[HFDBG] hooked resampler candidate: {name}")
+        # First/last ViT block to localize where the explosion starts.
+        if re.search(r"vision_model\.(blocks|layers)\.0$", name):
+            mod.register_forward_hook(mk_hook("vblock0"))
+            print(f"[HFDBG] hooked vblock0: {name}")
+        if re.search(r"vision_model\.(blocks|layers)\.(31|30|\d+)$", name):
+            # keep updating -> ends on the highest index = last block
+            mod.register_forward_hook(mk_hook("vblock_last"))
     if layers is not None:
         layers[0].register_forward_hook(mk_hook("L0"))
         if nlayer > 1:
@@ -196,6 +221,8 @@ def main():
     # crashes. vision_model_raw/vision_forward_out are [1024,1280] (pre-merge ViT);
     # resampler:* outputs are post-merge [256,2560] == our vl.vision_embeds.
     stats("patch_embed", captures.get("patch_embed"))
+    stats("vblock0", captures.get("vblock0"))
+    stats("vblock_last", captures.get("vblock_last"))
     stats("vision_model_raw", captures.get("vision_model_raw"))
     stats("vision_forward_out", captures.get("vision_forward_out"))
     for key in sorted(captures):
