@@ -140,7 +140,7 @@ def main():
 
     # Resampler/merger source (verify our Ernie4_5_VLResampler; note HF ran
     # temporal_linear even for a single image t=1 -- check how).
-    rsm = getattr(model, "resampler_model", None)
+    rsm = getattr(model, "resampler_model", None) or getattr(backbone, "resampler_model", None)
     if rsm is not None:
         dump_source("resampler_model.forward", type(rsm).forward)
         print("[HFDBG] resampler children:", [n for n, _ in rsm.named_children()])
