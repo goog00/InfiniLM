@@ -151,7 +151,8 @@ def main():
                       {k: getattr(g, k, None) for k in
                        ("use_token_type_bias", "norm_min", "moe_k", "top_k",
                         "num_experts", "num_experts_tensor", "config_topk", "use_correction_bias")})
-            for dm in ("fused_gate_and_dispatch", "forward_experts", "gate_distribution"):
+            for dm in ("fused_gate_logits_process_fused", "fused_gate_logits_process",
+                       "combine_expert_output", "gate_distribution"):
                 dmo = getattr(moe, dm, None)
                 if dmo is not None and callable(dmo):
                     dump_source(f"moe.{dm}", dmo)
