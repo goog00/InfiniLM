@@ -261,6 +261,14 @@ infinicore::Tensor Ernie4_5_VLMoeSparseMoeBlock::forward(const infinicore::Tenso
         }
     }
 
+    if (ernie_dbg_enabled()) {
+        long long checksum = 0;
+        for (size_t i = 0; i < ntoken; ++i) checksum += static_cast<long long>(tt_data[i]);
+        std::fprintf(stderr, "[ERNIE_DBG] moe.split ntext=%zu nvision=%zu tt_sum=%lld\n",
+                     text_idxs.size(), vision_idxs.size(), checksum);
+        std::fflush(stderr);
+    }
+
     // 3) Per-modality batch gate + per-token expert dispatch.
     auto dispatch_modality = [&](const std::vector<size_t> &idxs,
                                   size_t modality,

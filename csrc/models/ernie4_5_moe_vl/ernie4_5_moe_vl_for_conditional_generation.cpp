@@ -53,7 +53,13 @@ infinicore::Tensor Ernie4_5_VLMoeForConditionalGeneration::derive_token_type_ids
             tt[i] = 1;
         }
     }
-    return token_type->to(input_ids->device());
+    // Keep token_type on CPU: the MoE dispatch is the only consumer and it reads
+    // these values on the host (Tensor::to(cpu) then raw pointer). Round-tripping
+    // this I64 tensor through MetaX device memory is wasteful and unreliable --
+    // device I64 transfers can drop/corrupt elements, randomly flipping a token's
+    // text/vision classification and routing it through the wrong expert set,
+    // which manifests as non-deterministic output across runs.
+    return token_type;
 }
 
 infinicore::Tensor Ernie4_5_VLMoeForConditionalGeneration::merge_vision_embeddings(
