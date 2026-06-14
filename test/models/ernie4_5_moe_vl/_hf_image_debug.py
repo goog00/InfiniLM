@@ -272,6 +272,18 @@ def main():
         layers[0].register_forward_hook(mk_hook("L0"))
         if nlayer > 1:
             layers[1].register_forward_hook(mk_hook("L1"))
+            # Layer-1 MoE internals: input (post input_layernorm), shared-expert
+            # output, full MoE output -> compare to our moe.input / moe.shared.
+            moe1 = getattr(layers[1], "mlp", None)
+            if moe1 is not None:
+                moe1.register_forward_pre_hook(
+                    lambda m, i: captures.__setitem__("moe1_in", i[0]))
+                moe1.register_forward_hook(
+                    lambda m, i, o: captures.__setitem__(
+                        "moe1_out", o[0] if isinstance(o, tuple) else o))
+                se1 = getattr(moe1, "shared_experts", None)
+                if se1 is not None:
+                    se1.register_forward_hook(mk_hook("moe1_shared"))
 
     # Plain single forward (no generate -> avoids the remote code's legacy-cache
     # past_key_values[0][0] assumption). use_cache=False keeps it a pure prefill.
@@ -295,6 +307,9 @@ def main():
         if key.startswith("resampler:"):
             stats(key, captures[key])
     stats("L0 stream", captures.get("L0"))
+    stats("moe1_in", captures.get("moe1_in"))
+    stats("moe1_shared", captures.get("moe1_shared"))
+    stats("moe1_out", captures.get("moe1_out"))
     stats("L1 stream", captures.get("L1"))
     if logits is not None:
         top = torch.topk(logits, 5)
