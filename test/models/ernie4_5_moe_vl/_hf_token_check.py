@@ -84,9 +84,16 @@ def main():
     tt = inputs.get("token_type_ids")
     if tt is not None:
         base = tt[0].tolist()[:S]
-        nvision = sum(1 for v in base if v != 0)
+        vis_pos = [i for i, v in enumerate(base) if v != 0]
+        nvision = len(vis_pos)
+        if vis_pos:
+            lo, hi = vis_pos[0], vis_pos[-1]
+            gaps = [vis_pos[i] for i in range(1, len(vis_pos)) if vis_pos[i] != vis_pos[i - 1] + 1]
+            print(f"[CHK] HF vision span: count={nvision} idx=[{lo}..{hi}] contiguous={not gaps} "
+                  f"ids: before={prompt_ids[lo-1] if lo>0 else None} first={prompt_ids[lo]} "
+                  f"last={prompt_ids[hi]} after={prompt_ids[hi+1] if hi+1<S else None}")
         inputs["token_type_ids"] = torch.tensor([base + [0] * G + [0]], dtype=tt.dtype)
-        print(f"[CHK] token_type_ids len={S + G + 1} prompt_nvision={nvision} (expect 256)")
+        print(f"[CHK] token_type_ids len={S + G + 1} prompt_nvision={nvision} (our impl marks 256)")
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model, dtype=torch.bfloat16, device_map="auto", trust_remote_code=True)
