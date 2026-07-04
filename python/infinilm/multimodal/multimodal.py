@@ -23,7 +23,13 @@ def resolve_multimodal_inputs(messages: Union[List[dict], dict]):
                 # TODO support other image url formats
                 images.append(Image.open(item["image_url"]))
 
-            else:  # TODO support video/audio
-                raise NotImplementedError("Only image input is supported for now")
+            elif item.get("type") == "video":
+                # Pass the source path through; the processor decodes, samples
+                # frames, burns timestamps, and patchifies (see
+                # Ernie4_5_VLMoeProcessor._decode_and_sample_frames).
+                videos.append(item["video_url"])
+
+            else:  # TODO support audio
+                raise NotImplementedError("Only image and video inputs are supported")
 
     return images, videos, audios
